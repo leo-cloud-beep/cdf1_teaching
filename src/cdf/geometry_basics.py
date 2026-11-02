@@ -403,3 +403,186 @@ def create_stair_cut(body, N):
         raise ValueError("Boolean Difference ist fehlgeschlagen.")
 
     return cutter, cut_body, tread, rise
+
+'--------------------------------------------------------------------------------'
+
+import Rhino.Geometry as rg
+
+def create_curve(t_values, y_values, z_values):
+    t_values = list(t_values)
+    y_values = list(y_values)
+    z_values = list(z_values)
+
+    if not (len(t_values) == len(y_values) == len(z_values)):
+        raise ValueError("t, y und z müssen gleich viele Werte enthalten.")
+
+    if len(t_values) < 2:
+        raise ValueError("Es werden mindestens zwei Werte benötigt.")
+
+    points = []
+
+    for t, y, z in zip(t_values, y_values, z_values):
+        point = rg.Point3d(
+            float(t),  # x
+            float(y),  # y aus Graph Mapper 1
+            float(z)   # z aus Graph Mapper 2
+        )
+        points.append(point)
+
+    degree = min(3, len(points) - 1)
+
+    return rg.Curve.CreateInterpolatedCurve(points, degree)
+
+import math
+import random
+import Rhino.Geometry as rg
+
+
+def populate(curve, count, cube_size, radius, falloff=4.0, seed=1):
+    """Ermittelt Würfelmittelpunkte um die Kurve.
+    Nahe an der Kurve liegende Positionen werden bevorzugt.
+    """
+
+    cube_size = float(cube_size)
+    radius = float(radius)
+    count = int(count)
+
+    if curve is None:
+        raise ValueError("Es wurde keine Kurve übergeben.")
+    if cube_size <= 0 or radius <= 0 or count < 1:
+        raise ValueError("Würfelgröße, Radius und Anzahl müssen positiv sein.")
+
+    bounds = curve.GetBoundingBox(True)
+
+    ix0 = int(math.floor((bounds.Min.X - radius) / cube_size))
+    ix1 = int(math.ceil((bounds.Max.X + radius) / cube_size))
+    iy0 = int(math.floor((bounds.Min.Y - radius) / cube_size))
+    iy1 = int(math.ceil((bounds.Max.Y + radius) / cube_size))
+    iz0 = int(math.floor((bounds.Min.Z - radius) / cube_size))
+    iz1 = int(math.ceil((bounds.Max.Z + radius) / cube_size))
+
+    rng = random.Random(seed)
+    candidates = []
+
+    for ix in range(ix0, ix1):
+        for iy in range(iy0, iy1):
+            for iz in range(iz0, iz1):
+                center = rg.Point3d(
+                    (ix + 0.5) * cube_size,
+                    (iy + 0.5) * cube_size,
+                    (iz + 0.5) * cube_size
+                )
+
+                success, parameter = curve.ClosestPoint(center)
+                if not success:
+                    continue
+
+                nearest_point = curve.PointAt(parameter)
+                distance = center.DistanceTo(nearest_point)
+
+                if distance <= radius:
+                    weight = math.exp(
+                        -falloff * (distance / radius) ** 2
+                    )
+                    random_value = max(rng.random(), 1e-12)
+                    rank = -math.log(random_value) / weight
+                    candidates.append((rank, center))
+
+    if len(candidates) < count:
+        raise ValueError(
+            "Es gibt nicht genug mögliche Positionen. "
+            "Vergrößere den Radius oder verkleinere die Würfel."
+        )
+
+    candidates.sort(key=lambda item: item[0])
+    return [center for rank, center in candidates[:count]]
+
+
+import math
+import random
+import Rhino.Geometry as rg
+
+
+def populate(curve, count, x_size, y_size, z_size, radius,
+             falloff=4.0, seed=1):
+    """Berechnet Mittelpunkte für Quader nahe der Kurve."""
+
+    x_size = float(x_size)
+    y_size = float(y_size)
+    z_size = float(z_size)
+    radius = float(radius)
+    count = int(count)
+
+    if curve is None:
+        raise ValueError("Es wurde keine Kurve übergeben.")
+    if min(x_size, y_size, z_size, radius) <= 0 or count < 1:
+        raise ValueError("Maße, Radius und Anzahl müssen positiv sein.")
+
+    bounds = curve.GetBoundingBox(True)
+
+    ix0 = int(math.floor((bounds.Min.X - radius) / x_size))
+    ix1 = int(math.ceil((bounds.Max.X + radius) / x_size))
+    iy0 = int(math.floor((bounds.Min.Y - radius) / y_size))
+    iy1 = int(math.ceil((bounds.Max.Y + radius) / y_size))
+    iz0 = int(math.floor((bounds.Min.Z - radius) / z_size))
+    iz1 = int(math.ceil((bounds.Max.Z + radius) / z_size))
+
+    rng = random.Random(seed)
+    candidates = []
+
+    for ix in range(ix0, ix1):
+        for iy in range(iy0, iy1):
+            for iz in range(iz0, iz1):
+                center = rg.Point3d(
+                    (ix + 0.5) * x_size,
+                    (iy + 0.5) * y_size,
+                    (iz + 0.5) * z_size
+                )
+
+                success, parameter = curve.ClosestPoint(center)
+                if not success:
+                    continue
+
+                nearest_point = curve.PointAt(parameter)
+                distance = center.DistanceTo(nearest_point)
+
+                if distance <= radius:
+                    weight = math.exp(
+                        -falloff * (distance / radius) ** 2
+                    )
+                    random_value = max(rng.random(), 1e-12)
+                    rank = -math.log(random_value) / weight
+                    candidates.append((rank, center))
+
+    if len(candidates) < count:
+        raise ValueError(
+            "Es gibt nicht genug Positionen. "
+            "Vergrößere den Radius oder verkleinere die Quader."
+        )
+
+    candidates.sort(key=lambda item: item[0])
+    return [center for rank, center in candidates[:count]]
+
+
+def create_cubes(centers, x_size, y_size, z_size):
+    """Erzeugt Quader mit unabhängig einstellbaren X-, Y- und Z-Maßen."""
+
+    x_size = float(x_size)
+    y_size = float(y_size)
+    z_size = float(z_size)
+
+    if min(x_size, y_size, z_size) <= 0:
+        raise ValueError("Alle drei Maße müssen größer als 0 sein.")
+
+    cubes = []
+
+    for center in centers:
+        box = rg.Box(
+            rg.Plane.WorldXY,
+            rg.Interval(center.X - x_size / 2.0, center.X + x_size / 2.0),
+            rg.Interval(center.Y - y_size / 2.0, center.Y + y_size / 2.0),
+            rg.Interval(center.Z - z_size / 2.0, center.Z + z_size / 2.0)
+        )
+        cubes.append(box.ToBrep())
+
+    return cubes
