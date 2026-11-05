@@ -54,6 +54,29 @@ def boolean_difference(brep_a, brep_b):
     return result
 
 
+def boolean_union(breps):
+    """Perform a boolean union operation on multiple Breps.
+
+    breps : iterable of Rhino.Geometry.Brep -- the Breps to join
+
+    Returns a list of Rhino.Geometry.Brep objects resulting from the union.
+    """
+    if breps is None:
+        raise ValueError("breps must contain at least two Breps.")
+
+    try:
+        breps = list(breps)
+    except TypeError:
+        raise TypeError("breps must be an iterable of Rhino.Geometry.Brep objects.")
+
+    if len(breps) < 2:
+        raise ValueError("At least two Breps are required for a boolean union.")
+    if any(brep is None for brep in breps):
+        raise ValueError("breps must not contain None.")
+
+    return rg.Brep.CreateBooleanUnion(breps, 0.001)
+
+
 def copy_brep_along_z(brep, distance, copy_count):
     """
     Create copies of a Brep, each offset in the +Z direction.
@@ -109,6 +132,64 @@ def create_cylinder(base_point=None, height=10.0, radius=5.0, axis=None, cap_bot
     base_circle = rg.Circle(plane, radius)
     cylinder = rg.Cylinder(base_circle, height)
     return cylinder.ToBrep(cap_bottom, True)
+
+def create_pyramid(point=None, number_of_corners=4, height=10.0, radius=5.0,
+                   plane=None):
+    """Create a closed pyramid with a regular polygon base.
+
+    point : Rhino.Geometry.Point3d -- center of the base
+    number_of_corners : int -- number of sides in the base polygon
+    height : float -- distance from the base to the apex
+    radius : float -- distance from the base center to each corner
+    plane : Rhino.Geometry.Plane -- base orientation; the pyramid extends
+            along its normal
+
+    Returns a closed Rhino.Geometry.Brep.
+    """
+    if point is None:
+        point = rg.Point3d(0, 0, 0)
+    if plane is None:
+        plane = rg.Plane.WorldXY
+
+    number_of_corners = int(number_of_corners)
+    if number_of_corners < 3:
+        raise ValueError("number_of_corners must be at least 3.")
+    if height <= 0 or radius <= 0:
+        raise ValueError("Height and radius must be positive.")
+    if not plane.IsValid:
+        raise ValueError("plane must be a valid Rhino.Geometry.Plane.")
+
+    base_points = []
+    for i in range(number_of_corners):
+        angle = 2.0 * math.pi * i / number_of_corners
+        base_points.append(
+            point
+            + plane.Plane.XAxis * (radius * math.cos(angle))
+            + plane.Plane.YAxis * (radius * math.sin(angle))
+        )
+
+    base_outline = rg.Polyline(base_points + [base_points[0]]).ToNurbsCurve()
+    tolerance = 0.001
+    base_faces = rg.Brep.CreatePlanarBreps(base_outline, tolerance)
+    if not base_faces:
+        raise ValueError("Could not create the pyramid base.")
+
+    apex = point + plane.Plane.Normal * height
+    faces = [base_faces[0]]
+    for i in range(number_of_corners):
+        next_i = (i + 1) % number_of_corners
+        side_face = rg.Brep.CreateFromCornerPoints(
+            base_points[i], base_points[next_i], apex, tolerance
+        )
+        if side_face is None:
+            raise ValueError("Could not create a pyramid side.")
+        faces.append(side_face)
+
+    pyramid = rg.Brep.JoinBreps(faces, tolerance)
+    if pyramid is None or len(pyramid) != 1 or not pyramid[0].IsSolid:
+        raise ValueError("Could not join the pyramid into a closed Brep.")
+
+    return pyramid[0]
 
 def boolean_difference1(brep_a, brep_b):
 
@@ -586,3 +667,168 @@ def create_cubes(centers, x_size, y_size, z_size):
         cubes.append(box.ToBrep())
 
     return cubes
+
+
+def attach_module(module, ports, target_port, source_port_index=0):
+    """
+    Attach one copy of `module` to an existing `target_port`.
+
+    module: geometry of the module
+    ports: list of the module's outward-facing port planes
+    target_port: port plane on the existing assembly
+    source_port_index: which port on the new copy to connect
+    """
+
+    if module is None:
+        raise ValueError("Module geometry is missing.")
+
+    ports = list(ports)
+
+    if not ports:
+        raise ValueError("No port planes were provided.")
+
+    if source_port_index < 0 or source_port_index >= len(ports):
+        raise IndexError("source_port_index is outside the ports list.")
+
+    source_port = ports[source_port_index]
+
+    # Reverse the target plane so the two connected port normals oppose each other.
+    target_flipped = rg.Plane(
+        target_port.Origin,
+        target_port.XAxis,
+        -target_port.YAxis
+    )
+
+    # Move the chosen source port onto the reversed target port.
+    transform = rg.Transform.PlaneToPlane(source_port, target_flipped)
+
+    attached_geometry = module.Duplicate()
+    if not attached_geometry.Transform(transform):
+        raise RuntimeError("Could not transform the module geometry.")
+
+    # Return the new positions of all ports, for later growth.
+    attached_ports = []
+    for port in ports:
+        moved_port = rg.Plane(port.Origin, port.XAxis, port.YAxis)
+        moved_port.Transform(transform)
+        attached_ports.append(moved_port)
+
+    return attached_geometry, attached_ports
+
+import random
+import Rhino.Geometry as rg
+
+
+def _has_volume_overlap(a, b, tolerance):
+    # Collision checking needs closed solid Breps.
+    if not isinstance(a, rg.Brep) or not isinstance(b, rg.Brep):
+        raise TypeError("Collision checking needs Brep geometry.")
+    if not a.IsSolid or not b.IsSolid:
+        raise ValueError(
+            "Collision checking needs closed solids. Cap the module first."
+        )
+
+    # Skip the slower Boolean check if their bounding boxes do not meet.
+    box_a = a.GetBoundingBox(True)
+    box_b = b.GetBoundingBox(True)
+    overlap_box = rg.BoundingBox.Intersection(box_a, box_b)
+
+    if not overlap_box.IsValid:
+        return False
+
+    intersection = rg.Brep.CreateBooleanIntersection(a, b, tolerance)
+
+    # None means the Boolean check failed, so reject this placement.
+    if intersection is None:
+        return False
+
+    # A real overlap has a solid intersection with volume.
+    for part in intersection:
+        if part is not None and part.IsSolid:
+            volume = rg.VolumeMassProperties.Compute(part)
+            if volume is not None and volume.Volume > tolerance ** 3:
+                return True
+
+    # They may touch at their ports, but do not overlap in volume.
+    return False
+
+
+def grow_modules(module, ports, count=10, seed=1):
+    ports = list(ports)
+
+    if module is None:
+        raise ValueError("Module geometry is missing.")
+    if not ports:
+        raise ValueError("No port planes were provided.")
+
+    count = max(1, int(count))
+    tolerance = Rhino.RhinoDoc.ActiveDoc.ModelAbsoluteTolerance
+    rng = random.Random(seed)
+
+    shapes = [module.Duplicate()]
+    open_ports = [(plane, 0, i) for i, plane in enumerate(ports)]
+
+    for _ in range(count - 1):
+        placed = False
+
+        # Try different open ports and module ports until one fits.
+        options = [
+            (target_i, source_i)
+            for target_i in range(len(open_ports))
+            for source_i in range(len(ports))
+        ]
+        rng.shuffle(options)
+
+        for target_i, source_i in options:
+            target_plane = open_ports[target_i][0]
+            new_shape, new_ports = attach_module(
+                module, ports, target_plane, source_i
+            )
+
+            collides = any(
+                _has_volume_overlap(new_shape, existing, tolerance)
+                for existing in shapes
+            )
+
+            if not collides:
+                del open_ports[target_i]
+                shapes.append(new_shape)
+
+                for i, plane in enumerate(new_ports):
+                    if i != source_i:
+                        open_ports.append((plane, len(shapes) - 1, i))
+
+                placed = True
+                break
+
+        # Stop if no port pairing can place another copy without overlap.
+        if not placed:
+            break
+
+    free_ports = [item[0] for item in open_ports]
+    return shapes, free_ports
+
+#picks colurs dependant on their placement in time 
+def generation_values(shapes):
+    shapes = list(shapes)
+    total = len(shapes)
+
+    if total == 0:
+        return []
+    if total == 1:
+        return [0.0]
+
+    return [i / float(total - 1) for i in range(total)]
+
+from System.Drawing import Color
+
+def color_by_generation(shapes):
+    shapes = list(shapes)
+    total = len(shapes)
+
+    if total == 0:
+        return []
+    if total == 1:
+        return [0.0]
+
+    return [i / float(total - 1) for i in range(total)]
