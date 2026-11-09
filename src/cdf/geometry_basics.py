@@ -1,3 +1,4 @@
+
 """
 Geometry basics -- reusable Rhino.Geometry functions for Grasshopper.
 
@@ -719,40 +720,6 @@ import random
 import Rhino.Geometry as rg
 
 
-def _has_volume_overlap(a, b, tolerance):
-    # Collision checking needs closed solid Breps.
-    if not isinstance(a, rg.Brep) or not isinstance(b, rg.Brep):
-        raise TypeError("Collision checking needs Brep geometry.")
-    if not a.IsSolid or not b.IsSolid:
-        raise ValueError(
-            "Collision checking needs closed solids. Cap the module first."
-        )
-
-    # Skip the slower Boolean check if their bounding boxes do not meet.
-    box_a = a.GetBoundingBox(True)
-    box_b = b.GetBoundingBox(True)
-    overlap_box = rg.BoundingBox.Intersection(box_a, box_b)
-
-    if not overlap_box.IsValid:
-        return False
-
-    intersection = rg.Brep.CreateBooleanIntersection(a, b, tolerance)
-
-    # None means the Boolean check failed, so reject this placement.
-    if intersection is None:
-        return False
-
-    # A real overlap has a solid intersection with volume.
-    for part in intersection:
-        if part is not None and part.IsSolid:
-            volume = rg.VolumeMassProperties.Compute(part)
-            if volume is not None and volume.Volume > tolerance ** 3:
-                return True
-
-    # They may touch at their ports, but do not overlap in volume.
-    return False
-
-
 def grow_modules(module, ports, count=10, seed=1):
     ports = list(ports)
 
@@ -832,3 +799,546 @@ def color_by_generation(shapes):
         return [0.0]
 
     return [i / float(total - 1) for i in range(total)]
+
+GROW_ALONG_VERSION = "curve-guide-2026-11-08"
+
+
+def _bbox_has_interior_overlap(a, b, tolerance):
+    """A contact within the document's length tolerance is not penetration."""
+    return all(
+        min(getattr(a.Max, axis), getattr(b.Max, axis))
+        - max(getattr(a.Min, axis), getattr(b.Min, axis)) > tolerance
+        for axis in ("X", "Y", "Z")
+    )
+
+
+def _volume_overlap_state(a, b, tolerance, box_a=None, box_b=None):
+    """Return 'clear', 'overlap', or 'unknown'; never accept a failed Boolean."""
+    if not isinstance(a, rg.Brep) or not isinstance(b, rg.Brep):
+        raise TypeError("Collision checking needs Brep geometry.")
+    if not a.IsSolid or not b.IsSolid:
+        raise ValueError("Collision checking needs closed solids. Cap the module first.")
+    box_a = box_a if box_a is not None else a.GetBoundingBox(True)
+    box_b = box_b if box_b is not None else b.GetBoundingBox(True)
+    if not _bbox_has_interior_overlap(box_a, box_b, tolerance):
+        return "clear"
+    try:
+        intersection = rg.Brep.CreateBooleanIntersection(a, b, tolerance)
+    except Exception:
+        return "unknown"
+    if intersection is None:
+        return "unknown"
+    state = "clear"
+    try:
+        for part in intersection:
+            if part is None or not part.IsValid or not part.IsSolid:
+                if state != "overlap":
+                    state = "unknown"
+                continue
+            try:
+                mass = rg.VolumeMassProperties.Compute(part)
+            except Exception:
+                mass = None
+            if mass is None:
+                if state != "overlap":
+                    state = "unknown"
+                continue
+            try:
+                if abs(mass.Volume) > tolerance ** 3:
+                    state = "overlap"
+            finally:
+                mass.Dispose()
+    finally:
+        for part in intersection:
+            if part is not None:
+                part.Dispose()
+    return state
+
+
+def _has_volume_overlap(a, b, tolerance):
+    # Keep the existing helper's public behaviour: True rejects the placement.
+    return _volume_overlap_state(a, b, tolerance) != "clear"
+
+
+def _cg_point(point, transform):
+    result = rg.Point3d(point)
+    result.Transform(transform)
+    return result
+
+
+def _cg_plane(plane, transform=None):
+    result = rg.Plane(plane.Origin, plane.XAxis, plane.YAxis)
+    if transform is not None and not result.Transform(transform):
+        raise RuntimeError("Could not transform a port plane.")
+    return result
+
+
+def _cg_front(mask, station_count):
+    """Index of the first uncovered station, or station_count if complete."""
+    missing = ((1 << station_count) - 1) ^ mask
+    return station_count if not missing else (missing & -missing).bit_length() - 1
+
+
+def _cg_bit_count(mask):
+    # Rhino 8 Python 3.9 does not have int.bit_count().
+    return bin(mask).count("1")
+
+
+class _CGPart:
+    def __init__(self, uid, geometry, ports, center):
+        self.uid = uid
+        self.geometry = geometry
+        self.ports = ports
+        self.center = center
+        self.box = geometry.GetBoundingBox(True)
+
+
+class _CGPose:
+    def __init__(self, parent, target, source, transform, center, mask, tie,
+                 future, curve_distance):
+        self.parent = parent
+        self.target = target
+        self.source = source
+        self.transform = transform
+        self.center = center
+        self.mask = mask
+        self.tie = tie
+        self.future = future
+        self.curve_distance = curve_distance
+        self.part = None
+        self.blocked = False
+
+
+class _CurveGrower:
+    """Curve-guided port search with no distance boundary, then free aggregation."""
+
+    def __init__(self, module, ports, curve, count, seed, tolerance,
+                 rotation_steps, lookahead, beam_width,
+                 start_at_curve, max_attempts):
+        if not isinstance(module, rg.Brep):
+            raise TypeError("G: connect ONE Brep; set Type Hint = Brep, Item Access.")
+        if not module.IsValid or not module.IsSolid:
+            raise ValueError("G must be one valid CLOSED solid Brep (Cap / Solid Union).")
+        if not isinstance(curve, rg.Curve) or not curve.IsValid:
+            raise TypeError("C: connect a curve; set Type Hint = Curve, Item Access.")
+        if ports is None:
+            raise ValueError("P is missing. Connect the module's port planes.")
+        try:
+            ports = list(ports)
+        except TypeError:
+            raise TypeError("P needs List Access, Type Hint = Plane, and Flatten.")
+        if len(ports) < 2:
+            raise ValueError("P needs at least two port planes for continuing growth.")
+        if any(not isinstance(p, rg.Plane) or not p.IsValid for p in ports):
+            raise TypeError("P must contain planes, not vectors, points or Panel text.")
+
+        self.count = int(count)
+        self.tol = float(tolerance)
+        if self.count < 1:
+            raise ValueError("count must be >= 1.")
+        if not math.isfinite(self.tol) or self.tol <= 0:
+            raise ValueError("collision_tolerance must be a positive length.")
+        self.rotation_steps = int(rotation_steps)
+        self.lookahead = int(lookahead)
+        self.beam_width = int(beam_width)
+        self.max_attempts = int(max_attempts)
+        if not 1 <= self.rotation_steps <= 72:
+            raise ValueError("rotation_steps must be between 1 and 72.")
+        if not 1 <= self.lookahead <= 6 or not 1 <= self.beam_width <= 12:
+            raise ValueError("lookahead: 1..6; beam_width: 1..12.")
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be positive.")
+
+        self.rng = random.Random(int(seed))
+        self.module = module.DuplicateBrep()
+        if self.module.SolidOrientation == rg.BrepSolidOrientation.Inward:
+            self.module.Flip()
+        mass = rg.VolumeMassProperties.Compute(self.module)
+        if mass is None:
+            raise ValueError("G: could not calculate the solid's volume and centroid.")
+        try:
+            self.reference = rg.Point3d(mass.Centroid)
+        finally:
+            mass.Dispose()
+
+        # Check each connector against the actual solid. A supporting port plane
+        # has the ENTIRE solid on one side. This lets us prove that a correctly
+        # attached parent and child only touch, without a coplanar Boolean.
+        self.ports, self.supported = [], []
+        self.flipped_ports = 0
+        for i, original in enumerate(ports):
+            port = _cg_plane(original)
+            closest = self.module.ClosestPoint(port.Origin)
+            if not closest.IsValid or closest.DistanceTo(port.Origin) > 5.0 * self.tol:
+                raise ValueError(
+                    "P[{0}] is not on the module surface. Use the centre of the "
+                    "OUTER end face, in the same coordinates as G.".format(i)
+                )
+            local = self.module.DuplicateBrep()
+            try:
+                local.Transform(rg.Transform.PlaneToPlane(port, rg.Plane.WorldXY))
+                box = local.GetBoundingBox(True)
+            finally:
+                local.Dispose()
+            support_epsilon = self.tol * 0.001
+            negative = box.Max.Z <= support_epsilon and box.Min.Z < -self.tol
+            positive = box.Min.Z >= -support_epsilon and box.Max.Z > self.tol
+            if positive:
+                port = rg.Plane(port.Origin, port.XAxis, -port.YAxis)
+                self.flipped_ports += 1
+            self.ports.append(port)
+            self.supported.append(negative or positive)
+
+        radii = sorted(self.reference.DistanceTo(p.Origin) for p in self.ports)
+        self.step = 2.0 * radii[len(radii) // 2]
+        if self.step <= 10 * self.tol:
+            raise ValueError("Port origins are too close to the module centroid.")
+        # A cheap direction hint breaks ties between twists with the same
+        # centre. Real lookahead below still validates actual attachments.
+        self.exit_hints = [rg.Point3d(
+            p.Origin.X + p.ZAxis.X * self.step * 0.5,
+            p.Origin.Y + p.ZAxis.Y * self.step * 0.5,
+            p.Origin.Z + p.ZAxis.Z * self.step * 0.5
+        ) for p in self.ports]
+        # Used ONLY to decide which curve samples have been reached. This is
+        # derived from the module, and is NOT an admissible-distance boundary:
+        # candidates farther away remain available for multi-step detours.
+        self.cover_distance = 0.75 * self.step
+
+        self.curve = curve.DuplicateCurve()
+        if not self.curve.IsClosed:
+            if (self.reference.DistanceTo(curve.PointAtEnd)
+                    < self.reference.DistanceTo(curve.PointAtStart)):
+                self.curve.Reverse()
+        length = self.curve.GetLength()
+        if length <= self.tol:
+            raise ValueError("C has zero length or is too short.")
+        divisions = max(2, int(math.ceil(length / (self.cover_distance * 0.4))))
+        if divisions > 2000:
+            raise ValueError(
+                "C is very long relative to G. Check the units/scale of the curve and module."
+            )
+        self.stations = [self.curve.PointAtNormalizedLength(i / float(divisions))
+                         for i in range(divisions + 1)]
+        if any(not p.IsValid for p in self.stations):
+            raise ValueError("Could not sample C by arc length.")
+        self.full_mask = (1 << len(self.stations)) - 1
+        self.stats = dict(poses=0, projection_failed=0, checked=0, overlap=0,
+                          boolean_failed=0, parent_contact=0)
+        self.cache = {}
+        self.next_uid = 0
+        self.parts, self.open_ports = [], []
+        self.mask = 0
+        self.reason = None
+
+        seed_transform = rg.Transform.Identity
+        if start_at_curve:
+            tangent = rg.Vector3d(self.curve.TangentAtStart)
+            if not tangent.Unitize():
+                raise ValueError("C has no valid tangent at its start.")
+            # Rotate the complete module and all planes together. Subsequent
+            # attachments NEVER substitute a curve-tangent plane for a real port.
+            # Align a route THROUGH two ports, not one arm with the tangent.
+            # A tetrahedral module has no straight-through pair: aligning one
+            # arm exactly with the curve forces the following step far sideways.
+            # The port-to-port direction shares this zigzag between both sides.
+            entry, exit_port = max(
+                ((a, b) for a in self.ports for b in self.ports if a is not b),
+                key=lambda pair: pair[0].Origin.DistanceTo(pair[1].Origin)
+            )
+            forward = exit_port.Origin - entry.Origin
+            if forward * tangent < 0:
+                forward = -forward
+            if not forward.Unitize():
+                raise ValueError("P needs distinct connector origins.")
+            turn = rg.Transform.Rotation(forward, tangent, self.reference)
+            move = rg.Transform.Translation(self.curve.PointAtStart - self.reference)
+            seed_transform = move * turn
+        seed_part = self._make_part(seed_transform)
+        distance = self._distance(seed_part.center)
+        if distance is None:
+            raise ValueError("Could not evaluate the guide curve near the start module.")
+        self.parts.append(seed_part)
+        self.open_ports = [(seed_part, i) for i in range(len(self.ports))]
+        self.mask = self._coverage(seed_part.center)
+        self.guided_count = 1
+
+    def _make_part(self, transform):
+        geometry = self.module.DuplicateBrep()
+        if not geometry.Transform(transform):
+            geometry.Dispose()
+            raise RuntimeError("Could not transform the module Brep.")
+        ports = [_cg_plane(p, transform) for p in self.ports]
+        result = _CGPart(self.next_uid, geometry, ports,
+                         _cg_point(self.reference, transform))
+        self.next_uid += 1
+        return result
+
+    def _distance(self, point):
+        success, parameter = self.curve.ClosestPoint(point)
+        if not success:
+            return None
+        return point.DistanceTo(self.curve.PointAt(parameter))
+
+    def _coverage(self, center):
+        mask = 0
+        for i, station in enumerate(self.stations):
+            if center.DistanceTo(station) <= self.cover_distance:
+                mask |= 1 << i
+        return mask
+
+    def _poses(self, entry, guided):
+        parent, target_index = entry
+        key = (parent.uid, target_index, guided)
+        if key in self.cache:
+            return self.cache[key]
+        target = parent.ports[target_index]
+        flipped = rg.Plane(target.Origin, target.XAxis, -target.YAxis)
+        poses = []
+        for source_index, source in enumerate(self.ports):
+            mate = rg.Transform.PlaneToPlane(source, flipped)
+            for angle_index in range(self.rotation_steps):
+                angle = 2.0 * math.pi * angle_index / self.rotation_steps
+                roll = rg.Transform.Rotation(angle, target.ZAxis, target.Origin)
+                transform = roll * mate
+                center = _cg_point(self.reference, transform)
+                self.stats["poses"] += 1
+                distance = 0.0
+                if guided:
+                    distance = self._distance(center)
+                    if distance is None:
+                        self.stats["projection_failed"] += 1
+                        continue
+                mask = self._coverage(center) if guided else 0
+                future = [_cg_point(p, transform) for i, p in enumerate(self.exit_hints)
+                          if i != source_index] if guided else []
+                poses.append(_CGPose(parent, target_index, source_index,
+                                     transform, center, mask, self.rng.random(),
+                                     future, distance))
+        self.cache[key] = poses
+        return poses
+
+    def _valid(self, pose, path):
+        if pose.blocked:
+            return False
+        if self.stats["checked"] >= self.max_attempts:
+            self.reason = "search_budget"
+            return False
+        self.stats["checked"] += 1
+        if pose.part is None:
+            pose.part = self._make_part(pose.transform)
+        candidate = pose.part
+        for existing in self.parts + [p.part for p in path]:
+            if (existing is pose.parent and self.supported[pose.target]
+                    and self.supported[pose.source]):
+                # Both solids are proven to lie behind their outward port
+                # planes. Mating reverses those normals: opposite half-spaces.
+                self.stats["parent_contact"] += 1
+                continue
+            state = _volume_overlap_state(candidate.geometry, existing.geometry,
+                                          self.tol, candidate.box, existing.box)
+            if state != "clear":
+                counter = "overlap" if state == "overlap" else "boolean_failed"
+                self.stats[counter] += 1
+                # A rejection against committed geometry remains a rejection.
+                # A speculative-path collision must NOT poison other paths.
+                if existing in self.parts:
+                    pose.blocked = True
+                return False
+        return True
+
+    def _rank(self, mask, pose):
+        front = _cg_front(mask, len(self.stations))
+        goal = self.stations[min(front, len(self.stations) - 1)]
+        # Attraction, not containment: distance is a soft cost with no cut-off.
+        # First reward newly reached curve sections, then prefer a short route
+        # back to the next missing section. The lookahead can accept a lateral
+        # first step when its continuation is more useful.
+        distance = round((pose.center.DistanceTo(goal)
+                          + 0.25 * pose.curve_distance) / self.step, 6)
+        future = min(p.DistanceTo(goal) for p in getattr(pose, "future", [pose.center]))
+        return (-front, -_cg_bit_count(mask), distance,
+                round(future / self.step, 6), pose.tie)
+
+    def _configuration_key(self, pose):
+        # Symmetric modules can yield the same physical connector layout from
+        # several source/roll combinations. Do not fill the beam with copies.
+        scale = max(self.tol, self.step * 1e-6)
+        return tuple(sorted(
+            tuple(int(round(value / scale)) for value in
+                  (p.Origin.X, p.Origin.Y, p.Origin.Z))
+            for i, p in enumerate(pose.part.ports) if i != pose.source
+        ))
+
+    def _guided_path(self):
+        front = _cg_front(self.mask, len(self.stations))
+        goal = self.stations[front]
+        baseline_distance = min(part.center.DistanceTo(goal) for part in self.parts)
+        beam = [([], self.mask)]
+        best_bridge = None
+        best_gain = None
+        for depth in range(min(self.lookahead, self.count - len(self.parts))):
+            choices = []
+            for path, mask in beam:
+                entries = self.open_ports if not path else [
+                    (path[-1].part, i) for i in range(len(self.ports))
+                    if i != path[-1].source
+                ]
+                for entry in entries:
+                    for pose in self._poses(entry, True):
+                        if not pose.blocked:
+                            next_mask = mask | pose.mask
+                            key = self._rank(next_mask, pose)
+                            choices.append((key, path, next_mask, pose))
+            choices.sort(key=lambda item: item[0])
+            next_beam = []
+            seen = set()
+            for key, path, next_mask, pose in choices:
+                if self._valid(pose, path):
+                    new_path = path + [pose]
+                    # Sideways steps are permitted. A path can earn coverage
+                    # on its second or third step, rather than on every step.
+                    if next_mask == self.full_mask:
+                        return new_path[:1]
+                    if next_mask != self.mask:
+                        if best_gain is None or key < best_gain[0]:
+                            best_gain = (key, new_path)
+                    configuration = self._configuration_key(pose)
+                    if configuration in seen:
+                        continue
+                    seen.add(configuration)
+                    next_beam.append((new_path, next_mask))
+                    if pose.center.DistanceTo(goal) < baseline_distance - self.tol:
+                        if best_bridge is None or key < best_bridge[0]:
+                            best_bridge = (key, new_path)
+                    if len(next_beam) >= self.beam_width:
+                        break
+                if self.reason == "search_budget":
+                    return None
+            beam = next_beam
+            if not beam:
+                break
+        # Commit only the first step of the best route, then re-plan. The
+        # selected twist has a checked continuation instead of a random future.
+        best = best_gain if best_gain is not None else best_bridge
+        return None if best is None else best[1][:1]
+
+    def _commit(self, pose, guided):
+        self.open_ports.remove((pose.parent, pose.target))
+        self.parts.append(pose.part)
+        self.open_ports.extend((pose.part, i) for i in range(len(self.ports))
+                               if i != pose.source)
+        if guided:
+            self.mask |= pose.mask
+            self.guided_count += 1
+
+    def run(self):
+        while self.mask != self.full_mask and len(self.parts) < self.count:
+            path = self._guided_path()
+            if path is None:
+                self.reason = self.reason or "blocked_along_curve"
+                break
+            for pose in path:
+                self._commit(pose, True)
+
+        if self.mask == self.full_mask:
+            # Free spreading starts only after measured curve coverage.
+            while len(self.parts) < self.count:
+                entries = list(self.open_ports)
+                self.rng.shuffle(entries)
+                placed = False
+                for entry in entries:
+                    options = list(self._poses(entry, False))
+                    self.rng.shuffle(options)
+                    for pose in options:
+                        if self._valid(pose, []):
+                            self._commit(pose, False)
+                            placed = True
+                            break
+                        if self.reason == "search_budget":
+                            break
+                    if placed or self.reason == "search_budget":
+                        break
+                if not placed:
+                    self.reason = self.reason or "blocked_spread"
+                    break
+        self.reason = self.reason or (
+            "complete" if self.mask == self.full_mask else "count_limit_before_coverage"
+        )
+        fraction = _cg_bit_count(self.mask) / float(len(self.stations))
+        explanations = {
+            "complete": "Kurve abgedeckt; Gesamtzahl erreicht.",
+            "count_limit_before_coverage":
+                "count erreicht, bevor die Kurve abgedeckt ist. count erhoehen.",
+            "blocked_along_curve":
+                "Keine passende Fortsetzung in der begrenzten Suche gefunden. "
+                "Ports und Meldungen unten pruefen; ggf. lookahead oder rotation_steps erhoehen.",
+            "blocked_spread": "Kurve abgedeckt; keine weitere kollisionsfreie Verbindung gefunden.",
+            "search_budget": "Suchbudget erreicht. Ergebnisse sind teilweise; max_attempts erhoehen.",
+        }
+        message = (
+            "{version}\n{count}/{requested} Module; davon {guided} in der Kurvenphase.\n"
+            "Kurvenabdeckung: {coverage:.1f}% ({covered}/{stations} Messpunkte).\n"
+            "{explanation}\n"
+            "Fehlgeschlagene Kurvenprojektionen: {projection_failed}; "
+            "Ueberschneidungen: {overlap}; "
+            "unklare Boolean-Pruefungen: {failed}; geprueft: {checked}.\n"
+            "Nach aussen korrigierte Ports: {flipped}."
+        ).format(version=GROW_ALONG_VERSION, count=len(self.parts), requested=self.count,
+                 guided=self.guided_count, coverage=100 * fraction,
+                 covered=_cg_bit_count(self.mask), stations=len(self.stations),
+                 explanation=explanations[self.reason],
+                 projection_failed=self.stats["projection_failed"],
+                 overlap=self.stats["overlap"], failed=self.stats["boolean_failed"],
+                 checked=self.stats["checked"], flipped=self.flipped_ports)
+        info = dict(version=GROW_ALONG_VERSION, reason=self.reason, message=message,
+                    coverage=fraction, count=len(self.parts), guided_count=self.guided_count,
+                    guide_mode="curve_attraction", coverage_distance=self.cover_distance,
+                    stations=self.stations,
+                    uncovered_points=[p for i, p in enumerate(self.stations)
+                                      if not self.mask & (1 << i)],
+                    stats=dict(self.stats), flipped_ports=self.flipped_ports)
+        shapes = [part.geometry for part in self.parts]
+        free_ports = [part.ports[i] for part, i in self.open_ports]
+        return shapes, free_ports, self.guided_count, info
+
+
+def grow_along_curve(module, ports, curve, count=50, seed=1, *,
+                     collision_tolerance=None, rotation_steps=12,
+                     lookahead=3, beam_width=5, start_at_curve=True,
+                     return_info=False, max_attempts=20000):
+    """Grow connected copies along a guide curve, then spread freely.
+
+    G/module: one valid closed Brep. P/ports: list of planes on the outer
+    connection faces, with outward Z axes. Circular faces can twist about Z;
+    the algorithm never tilts a mating face away from its actual counterpart.
+    C/curve: guide curve. The seed is moved to the nearest end by default.
+
+    count: maximum TOTAL number of modules, including the seed.
+    The curve is an attractor and has no hard distance boundary. Candidate
+        routes are ranked by curve coverage, distance to the next uncovered
+        section, and distance to the curve. Lateral detours are allowed.
+    Curve coverage is sampled at a spacing derived automatically from the
+        module size. A sample is reached within 1.5 times the median
+        centre-to-port distance. This recognition distance does NOT reject
+        candidate modules; it only controls progress and the phase switch.
+    rotation_steps: tested twists around each real connection (12 = 30 deg).
+    lookahead / beam_width: bounded search for useful sideways detours.
+    collision_tolerance: Rhino document LENGTH tolerance for overlap checks.
+    max_attempts: cap on expensive candidate checks, with a diagnostic on stop.
+
+    Grasshopper inputs: G, P, C, count, seed. Remove the old radius,
+        curve_tolerance and along_count inputs and arguments.
+    Returns (shapes, free_ports, guided_count). With return_info=True also
+    returns a dict with coverage, message, reason and uncovered_points.
+    A blocked search returns its partial result; it never silently claims that
+    the entire curve is covered. Re-evaluation with the same inputs is stable.
+    """
+    if collision_tolerance is None:
+        doc = Rhino.RhinoDoc.ActiveDoc
+        collision_tolerance = doc.ModelAbsoluteTolerance if doc is not None else 0.01
+    engine = _CurveGrower(module, ports, curve, count, seed,
+                         collision_tolerance, rotation_steps, lookahead, beam_width,
+                         start_at_curve, max_attempts)
+    result = engine.run()
+    return result if return_info else result[:3]
