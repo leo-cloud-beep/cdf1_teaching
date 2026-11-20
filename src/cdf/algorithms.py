@@ -1,573 +1,388 @@
-"""
-Geometry basics -- reusable Rhino.Geometry functions for Grasshopper.
-
-Adding a new function with Copilot
------------------------------------
-1. Open this file and select this chat model, then ask Copilot something like:
-   "Add a function here, all in Rhino geometry, that builds a <your shape/idea>.
-   Follow the same style as create_cone / create_fractal_tree (defaults for
-   optional inputs, a docstring listing params, return a Rhino.Geometry object)."
-2. Once the function is added, ask Copilot:
-   "Give me the Python code to use this function in a Grasshopper GHPython 3
-   component, importing it from computational_design_and_fabrication."
-3. Copy the snippet Copilot gives you into a GHPython component, wire up the
-   inputs as sliders/panels, and set the output variable (e.g. `a`).
-"""
-
 import math
-import Rhino.Geometry as rg
 import random
 
-def create_fractal_tree(
-    base_point=None,
-    base_plane=None,
-    length=10.0,
-    angle=25.0,
-    length_factor=0.7,
-    depth=8,
-    branch_count=2,
-):
+HYPERBOLIC_MODEL_VERSION = "rosette-1"
+
+
+# 1. INPUTS AND THE CROCHET GROWTH RULE
+def _integer(value, name, minimum, maximum):
+    number = float(value)
+    if not math.isfinite(number) or number != int(number):
+        raise ValueError(name + " must be a whole number.")
+    value = int(number)
+    if not minimum <= value <= maximum:
+        raise ValueError("{} must be between {} and {}.".format(
+            name, minimum, maximum))
+    return value
+
+
+def stitch_counts(base_chain_stitch_count, rows, increase):
+    """Row zero is the base chain; rows counts additional crochet rows.
+
+    Integer increase reproduces the screenshot's count exactly.
+    Fractional increase is an average growth factor, rounded for display;
+    the mesh uses the continuous, unrounded exponential growth law.
     """
-    Build a fractal (recursively branching) tree as a list of line segments.
+    counts = []
+    for row in range(rows + 1):
+        count = base_chain_stitch_count * increase ** row
+        counts.append(int(math.floor(count + 0.5)))
+    return counts
 
-    base_point    : Rhino.Geometry.Point3d -- start point of the trunk
-    base_plane    : Rhino.Geometry.Plane   -- plane whose YAxis is the trunk
-                     direction and ZAxis is the branching rotation axis
-    length        : float -- trunk length
-    angle         : float -- angle in degrees between sibling branches
-    length_factor : float -- length multiplier applied at each new generation
-    depth         : int   -- number of recursive branching generations
-    branch_count  : int   -- number of branches spawned at each node
 
-    Returns a list of Rhino.Geometry.Line.
+def _rosette_start(base, rows, factor, resolution):
+    """Sample a generalized Enneper seed with three broad lobes.
+
+    This is only an initial guess, not the hyperbolic target metric.
+    Its radial arc length is s(r) = r + r**5/5. Fit the base circumference
+    and total radial width before relaxing to the exponential row lengths.
     """
-    if base_point is None:
-        base_point = rg.Point3d(0, 0, 0)
-    if base_plane is None:
-        base_plane = rg.Plane.WorldXY
+    growth = math.log(factor) * rows
+    outer = 0.45 + 1.15 * min(1.0, growth / 3.0)
 
-    lines = []
+    def arc(r):
+        return r + r**5 / 5.0
 
-    def _grow(start, direction, branch_length, remaining_depth):
-        if remaining_depth <= 0 or branch_length <= 1e-6:
-            return
-
-        end = start + direction * branch_length
-        lines.append(rg.Line(start, end))
-
-        if branch_count <= 1:
-            offsets = [0.0]
+    # The ratio is strictly increasing, so bisection also handles a wide
+    # base with few rows without a fragile fixed-point iteration.
+    target = base / (2.0 * math.pi * rows)
+    low, high = 0.0, outer
+    for _ in range(48):
+        inner = (low + high) * 0.5
+        ratio = inner * (1.0 + inner**4) / (arc(outer) - arc(inner))
+        if ratio < target:
+            low = inner
         else:
-            span = angle * (branch_count - 1)
-            offsets = [-span / 2.0 + i * angle for i in range(branch_count)]
-
-        for offset in offsets:
-            rotated_direction = rg.Vector3d(direction)
-            rotated_direction.Rotate(math.radians(offset), base_plane.ZAxis)
-            _grow(end, rotated_direction, branch_length * length_factor, remaining_depth - 1)
-
-    _grow(base_point, base_plane.YAxis, length, depth)
-
-    return lines
-
-
-def create_crochet_pseudosphere(
-    rounds=4,
-    first_round=12,
-    increase=3,
-    base_chain=4,
-    stitch_width=1.0,
-    stitch_height=2.0,
-    iterations=150,
-    seed=1,
-    max_stitches=1500,
-):
-    """Build a crocheted hyperbolic form ("pseudosphere") as a mesh.
-
-    The function follows the crochet pattern step by step:
-      1. a small ring made of chain stitches,
-      2. a first round of double crochets into the ring,
-      3. more rounds, where every stitch gets `increase` new stitches.
-
-    Each stitch is one mesh vertex. After every new round the stitches are
-    relaxed like small springs: a stitch wants to keep its width and its
-    height, and two stitches cannot be in the same place. Each round has more
-    stitches than a flat circle has room for, so the surface has to ruffle.
-
-    Params:
-        rounds (int): Number of rounds worked into the ring. Default 4.
-            Stitch count is multiplied by `increase` every round, so keep
-            this low (5 rounds with increase 3 is already 972 stitches).
-        first_round (int): Stitches in the first round. Default 12.
-        increase (int): New stitches worked into each stitch. Default 3.
-            1 gives a tube, 2 gives soft ruffles, 3 gives dense ruffles.
-        base_chain (int): Chain stitches in the starting ring. Default 4.
-            Only sets the size of the hole in the middle.
-        stitch_width (float): Width of one stitch. Default 1.0.
-        stitch_height (float): Height of one round. Default 2.0
-            (a double crochet is about twice as tall as it is wide).
-        iterations (int): Relaxation steps after each round. Default 150.
-            More steps give a smoother result but take longer.
-        seed (int): Seed for the small random offsets that let the surface
-            ruffle. Same seed gives the same shape. Default 1.
-        max_stitches (int): Safety limit on stitches in a single round.
-            Rounds that would exceed it are skipped, so the form stops
-            growing instead of freezing Rhino. Default 1500.
-
-    Returns:
-        Rhino.Geometry.Mesh: The crocheted surface. Each vertex is the top
-        of one stitch, each ring of vertices is one round.
-    """
-    rng = random.Random(seed)
-
-    points = []    # [x, y, z] of every stitch
-    fixed = []     # True for stitches that must not move (the starting ring)
-    springs = []   # (i, j, rest_length, stiffness)
-    linked = set() # pairs joined by a spring, these are skipped in collision
-    faces = []     # (a, b, c) vertex indices
-
-    def add_spring(i, j, rest, stiffness):
-        springs.append((i, j, rest, stiffness))
-        linked.add((min(i, j), max(i, j)))
-
-    # ------------------------------------------------------------------
-    # 1 + 2. Starting ring (the joined chain). It stays fixed at the origin.
-    # ------------------------------------------------------------------
-    ring_radius = base_chain * stitch_width / (2.0 * math.pi)
-    ring = []
-    for i in range(first_round):
-        angle = 2.0 * math.pi * i / first_round
-        points.append([ring_radius * math.cos(angle),
-                       ring_radius * math.sin(angle),
-                       0.0])
-        fixed.append(True)
-        ring.append(i)
-
-    # ------------------------------------------------------------------
-    # Relaxation: springs keep stitch sizes, collisions keep stitches apart.
-    # ------------------------------------------------------------------
-    collision_distance = 0.9 * stitch_width
-
-    def relax(steps):
-        for _ in range(steps):
-            # springs
-            for i, j, rest, stiffness in springs:
-                a = points[i]
-                b = points[j]
-                dx = b[0] - a[0]
-                dy = b[1] - a[1]
-                dz = b[2] - a[2]
-                length = math.sqrt(dx * dx + dy * dy + dz * dz)
-                if length < 1e-9:
-                    continue
-                move = stiffness * (length - rest) / length
-                if fixed[i] and fixed[j]:
-                    continue
-                if fixed[i]:
-                    b[0] -= dx * move
-                    b[1] -= dy * move
-                    b[2] -= dz * move
-                elif fixed[j]:
-                    a[0] += dx * move
-                    a[1] += dy * move
-                    a[2] += dz * move
-                else:
-                    move *= 0.5
-                    a[0] += dx * move
-                    a[1] += dy * move
-                    a[2] += dz * move
-                    b[0] -= dx * move
-                    b[1] -= dy * move
-                    b[2] -= dz * move
-
-            # collisions: sort stitches into a grid, compare only neighbours
-            cell = collision_distance
-            grid = {}
-            for index, p in enumerate(points):
-                key = (int(math.floor(p[0] / cell)),
-                       int(math.floor(p[1] / cell)),
-                       int(math.floor(p[2] / cell)))
-                grid.setdefault(key, []).append(index)
-
-            for (cx, cy, cz), members in grid.items():
-                for ox in (-1, 0, 1):
-                    for oy in (-1, 0, 1):
-                        for oz in (-1, 0, 1):
-                            others = grid.get((cx + ox, cy + oy, cz + oz))
-                            if not others:
-                                continue
-                            for i in members:
-                                for j in others:
-                                    if j <= i:
-                                        continue
-                                    if fixed[i] and fixed[j]:
-                                        continue
-                                    if (i, j) in linked:
-                                        continue
-                                    a = points[i]
-                                    b = points[j]
-                                    dx = b[0] - a[0]
-                                    dy = b[1] - a[1]
-                                    dz = b[2] - a[2]
-                                    d2 = dx * dx + dy * dy + dz * dz
-                                    if d2 >= cell * cell or d2 < 1e-12:
-                                        continue
-                                    dist = math.sqrt(d2)
-                                    push = (cell - dist) / dist
-                                    if fixed[i]:
-                                        b[0] += dx * push
-                                        b[1] += dy * push
-                                        b[2] += dz * push
-                                    elif fixed[j]:
-                                        a[0] -= dx * push
-                                        a[1] -= dy * push
-                                        a[2] -= dz * push
-                                    else:
-                                        push *= 0.5
-                                        a[0] -= dx * push
-                                        a[1] -= dy * push
-                                        a[2] -= dz * push
-                                        b[0] += dx * push
-                                        b[1] += dy * push
-                                        b[2] += dz * push
-
-    # ------------------------------------------------------------------
-    # 3 + 4. Work the rounds. Round 1 puts one stitch on each ring position,
-    # every later round puts `increase` stitches into each stitch.
-    # ------------------------------------------------------------------
-    grow_from = {}  # stitch index -> index of the stitch it was worked into
-
-    for round_index in range(rounds):
-        per_stitch = 1 if round_index == 0 else increase
-        if len(ring) * per_stitch > max_stitches:
-            break  # next round would be too big, stop at the last one that fits
-        new_ring = []
-        children_of = []
-
-        for parent in ring:
-            p = points[parent]
-
-            # growth direction: continue the line from grandparent to parent
-            if parent in grow_from:
-                g = points[grow_from[parent]]
-                direction = [p[0] - g[0], p[1] - g[1], p[2] - g[2]]
+            high = inner
+    inner = (low + high) * 0.5
+    scale = rows / (arc(outer) - arc(inner))
+    radii = []
+    for j in range(rows * resolution + 1):
+        target = arc(inner) + j / (resolution * scale)
+        low, high = inner, outer
+        for _ in range(40):
+            r = (low + high) * 0.5
+            if arc(r) < target:
+                low = r
             else:
-                direction = [p[0], p[1], 0.0]
-            size = math.sqrt(sum(c * c for c in direction)) or 1.0
-            direction = [c / size for c in direction]
+                high = r
+        radii.append((low + high) * 0.5)
+    return radii, scale, min(1.0, growth)
 
-            children = []
-            for _ in range(per_stitch):
-                jitter = 0.3 * stitch_width
-                points.append([
-                    p[0] + direction[0] * stitch_height + rng.uniform(-jitter, jitter),
-                    p[1] + direction[1] * stitch_height + rng.uniform(-jitter, jitter),
-                    p[2] + direction[2] * stitch_height + rng.uniform(-jitter, jitter),
-                ])
-                fixed.append(False)
-                child = len(points) - 1
-                grow_from[child] = parent
-                children.append(child)
-                new_ring.append(child)
-                # the post of the stitch
-                add_spring(parent, child, stitch_height, 1.0)
-            children_of.append(children)
 
-        count = len(new_ring)
-        for k in range(count):
-            # top of the round: every stitch is one stitch_width wide
-            add_spring(new_ring[k], new_ring[(k + 1) % count], stitch_width, 1.0)
-            # weak spring to the stitch after next, keeps the round smooth
-            if count > 4:
-                add_spring(new_ring[k], new_ring[(k + 2) % count],
-                           2.0 * stitch_width, 0.15)
+def _build_mesh(base, rows, factor, resolution, closed, seed):
+    """Sample crochet rows, then stitch neighbouring rows with triangles."""
+    points, coordinates, row_ids, faces = [], [], [], []
+    sample_counts = []
+    total = 0
+    for j in range(rows * resolution + 1):
+        t = float(j) / resolution
+        n = int(math.floor(base * resolution * factor ** t + 0.5))
+        total += n if closed else n + 1
+        if total > 6500:
+            raise ValueError("Mesh exceeds 6500 vertices. Reduce rows, "
+                             "increase or resolution. Growth is exponential.")
+        sample_counts.append(n)
 
-        # faces between the old round and the new round
-        parents = len(ring)
-        for j in range(parents):
-            children = children_of[j]
-            next_parent = ring[(j + 1) % parents]
-            next_child = children_of[(j + 1) % parents][0]
-            for k in range(len(children) - 1):
-                faces.append((ring[j], children[k], children[k + 1]))
-            faces.append((ring[j], children[-1], next_child))
-            faces.append((ring[j], next_child, next_parent))
+    rng = random.Random(seed)
+    phases = [rng.uniform(0.0, 2.0 * math.pi) for _ in range(3)]
+    if closed and factor > 1.0:
+        radii, rosette_scale, blend = _rosette_start(
+            base, rows, factor, resolution)
+    phase = (0.17 + (seed - 1) * 2.399963229728653) % (2.0 * math.pi)
+    for j, n in enumerate(sample_counts):
+        y = float(j) / resolution
+        ids = []
+        for i in range(n if closed else n + 1):
+            u = float(i) / n
+            angle = 2.0 * math.pi * u
+            # A smooth initial disturbance chooses a folding direction.
+            # Its amplitude is not a force or a constraint during relaxation.
+            wave = (math.sin(3.0 * angle + phases[0] + 0.20 * y)
+                    + 0.5 * math.sin(5.0 * angle + phases[1] - 0.17 * y)
+                    + 0.25 * math.cos(7.0 * angle + phases[2]))
+            z = 0.8 * min(1.0, (factor - 1.0) * 5.0) * (1.0 + 0.4*y) * wave
+            if closed:
+                radius = base / (2.0 * math.pi)
+                # A periodic flat strip embeds naturally as a cylinder.
+                p = [radius * math.cos(angle + phase),
+                     radius * math.sin(angle + phase), y]
+                if factor > 1.0:
+                    r, t = radii[j], angle + phase
+                    curled = [
+                        rosette_scale * (r*math.cos(t) - r**5*math.cos(5*t)/5),
+                        rosette_scale * (r*math.sin(t) + r**5*math.sin(5*t)/5),
+                        rosette_scale * 2*r**3*math.cos(3*t)/3,
+                    ]
+                    p = [(1.0-blend)*p[k] + blend*curled[k] for k in range(3)]
+            else:
+                p = [(u - 0.5) * base, y, z]
+            ids.append(len(points))
+            points.append(p)
+            coordinates.append((u, y))
+        row_ids.append(ids)
 
-        ring = new_ring
-        relax(iterations)
+    # A zipper triangulation joins rows with DIFFERENT numbers of points.
+    # All faces share vertex indices, including the closed-mode seam.
+    for j in range(len(row_ids) - 1):
+        lower, upper = row_ids[j], row_ids[j + 1]
+        n, m = sample_counts[j], sample_counts[j + 1]
+        i = k = 0
+        while i < n or k < m:
+            a = lower[i % len(lower)]
+            b = upper[k % len(upper)]
+            if k == m or (i < n and (i + 1)*m <= (k + 1)*n):
+                faces.append((a, lower[(i + 1) % len(lower)], b))
+                i += 1
+            else:
+                faces.append((a, upper[(k + 1) % len(upper)], b))
+                k += 1
+    return points, coordinates, row_ids, faces
 
-    # ------------------------------------------------------------------
-    # Build the Rhino mesh
-    # ------------------------------------------------------------------
+
+# 2. TARGET LENGTHS: EXTRA ROW LENGTH CREATES NEGATIVE TARGET CURVATURE
+def _target_distance(a, b, coordinates, base, factor, closed):
+    ua, ya = coordinates[a]
+    ub, yb = coordinates[b]
+    du = abs(ua - ub)
+    if closed:
+        du = min(du, 1.0 - du)
+    dx, dy = base * du, ya - yb
+    k = math.log(factor)
+    if k < 1.e-10:
+        return math.sqrt(dx*dx + dy*dy)
+    # Exact intrinsic distance for ds^2 = dy^2 + exp(2*k*y) dx^2.
+    # This numerically stable expression is equivalent to the hyperbolic
+    # upper-half-plane distance formula. See the guide's math appendix.
+    value = (math.sinh(0.5*k*dy)**2
+             + (0.5*k*dx)**2 * math.exp(k*(ya + yb)))
+    return 2.0 * math.asinh(math.sqrt(value)) / k
+
+
+def _constraints(faces, coordinates, base, factor, closed, seed):
+    edges = {}
+    for a, b, c in faces:
+        for i, j, opposite in ((a, b, c), (b, c, a), (c, a, b)):
+            key = (min(i, j), max(i, j))
+            edges.setdefault(key, []).append(opposite)
+    springs, hinges = [], []
+    for (a, b), opposite in sorted(edges.items()):
+        target = _target_distance(a, b, coordinates, base, factor, closed)
+        springs.append((a, b, target))
+        if len(opposite) == 2:
+            hinges.append((a, b, opposite[0], opposite[1]))
+    rng = random.Random(seed + 137)
+    rng.shuffle(springs)
+    rng.shuffle(hinges)
+    return springs, hinges
+
+
+# 3. RELAX THE SHEET IN THREE DIMENSIONS
+def _fit_lengths(points, springs, strength=0.9):
+    for a, b, target in springs:
+        p, q = points[a], points[b]
+        dx, dy, dz = q[0]-p[0], q[1]-p[1], q[2]-p[2]
+        length = math.sqrt(dx*dx + dy*dy + dz*dz)
+        if length < 1.e-12:
+            continue
+        amount = 0.5 * strength * (length - target) / length
+        dx, dy, dz = dx*amount, dy*amount, dz*amount
+        p[0] += dx; p[1] += dy; p[2] += dz
+        q[0] -= dx; q[1] -= dy; q[2] -= dz
+
+
+def _soften_folds(points, hinges, strength):
+    """Gently align adjacent triangles around their common edge.
+
+    This is a geometric bending regularizer, not a calibrated yarn law.
+    Length constraints are reapplied after this step.
+    """
+    for a, b, c, d in hinges:
+        p, q, r, s = points[a], points[b], points[c], points[d]
+        ex, ey, ez = q[0]-p[0], q[1]-p[1], q[2]-p[2]
+        length = math.sqrt(ex*ex + ey*ey + ez*ez)
+        if length < 1.e-12:
+            continue
+        ex, ey, ez = ex/length, ey/length, ez/length
+        rx, ry, rz = r[0]-p[0], r[1]-p[1], r[2]-p[2]
+        sx, sy, sz = s[0]-p[0], s[1]-p[1], s[2]-p[2]
+        rt = ex*rx + ey*ry + ez*rz
+        st = ex*sx + ey*sy + ez*sz
+        rx, ry, rz = rx-rt*ex, ry-rt*ey, rz-rt*ez
+        sx, sy, sz = sx-st*ex, sy-st*ey, sz-st*ez
+        hr = math.sqrt(rx*rx + ry*ry + rz*rz)
+        hs = math.sqrt(sx*sx + sy*sy + sz*sz)
+        if min(hr, hs) < 1.e-12:
+            continue
+        vx, vy, vz = rx/hr-sx/hs, ry/hr-sy/hs, rz/hr-sz/hs
+        length = math.sqrt(vx*vx + vy*vy + vz*vz)
+        if length < 1.e-12:
+            continue
+        vx, vy, vz = vx/length, vy/length, vz/length
+        r[0] += strength * (hr*vx-rx)
+        r[1] += strength * (hr*vy-ry)
+        r[2] += strength * (hr*vz-rz)
+        s[0] += strength * (-hs*vx-sx)
+        s[1] += strength * (-hs*vy-sy)
+        s[2] += strength * (-hs*vz-sz)
+
+
+def _relax(points, springs, hinges, iterations, progressive=False):
+    if iterations * (2*len(springs) + len(hinges)) > 35000000:
+        raise ValueError("This solve is too large. Reduce iterations, rows, "
+                         "increase or resolution.")
+    starting_lengths = None
+    if progressive and iterations:
+        starting_lengths = [math.sqrt(sum(
+            (points[a][i]-points[b][i])**2 for i in range(3)))
+            for a, b, _ in springs]
+    working = springs
+    for step in range(iterations):
+        progress = float(step) / max(1, iterations - 1)
+        if starting_lengths is not None and step % 5 == 0:
+            weight = min(1.0, step / max(1.0, iterations * 0.65))
+            working = [(a, b, (1.0-weight)*start + weight*target)
+                       for start, (a, b, target) in zip(starting_lengths, springs)]
+        # First find broad folds; then prioritize accurate edge lengths.
+        bend = 0.12 * (1.0 - 0.85 * max(0.0, (progress-0.7)/0.3))
+        _soften_folds(points, hinges, bend)
+        _fit_lengths(points, working)
+        _fit_lengths(points, working)
+    if iterations:
+        for _ in range(32):
+            _fit_lengths(points, springs)
+
+
+def generate(base_chain_stitch_count=8, rows=16, increase=1.25,
+             stitch_size=1.0, resolution=2, iterations=600,
+             closed=True, seed=1):
+    """Return plain Python geometry; safe to import outside Rhino.
+
+    Units follow the Rhino document: stitch_size controls width AND height.
+    closed joins the base chain into a ring; it does not make a solid.
+    """
+    base = _integer(base_chain_stitch_count, "base_chain_stitch_count", 2, 200)
+    rows = _integer(rows, "rows", 1, 40)
+    resolution = _integer(resolution, "resolution", 1, 4)
+    iterations = _integer(iterations, "iterations", 0, 1500)
+    seed = _integer(seed, "seed", 0, 2147483000)
+    factor, size = float(increase), float(stitch_size)
+    if not math.isfinite(factor) or not 1.0 <= factor <= 2.0:
+        raise ValueError("increase must be between 1.0 and 2.0.")
+    if not math.isfinite(size) or size <= 0.0:
+        raise ValueError("stitch_size must be positive and finite.")
+    if not isinstance(closed, bool):
+        raise ValueError("closed needs a Boolean Toggle, with bool Type Hint.")
+    if closed and base < 8:
+        raise ValueError("Use at least 8 base stitches for a circular model.")
+
+    points, uv, row_ids, faces = _build_mesh(
+        base, rows, factor, resolution, closed, seed)
+    springs, hinges = _constraints(faces, uv, base, factor, closed, seed)
+    _relax(points, springs, hinges, iterations,
+           progressive=closed and factor > 1.0)
+
+    errors = []
+    for a, b, target in springs:
+        p, q = points[a], points[b]
+        length = math.sqrt(sum((p[i]-q[i])**2 for i in range(3)))
+        errors.append(abs(length/target - 1.0))
+    # Solve in stitch units, then scale; size does not change the folding.
+    center = [sum(p[i] for p in points)/len(points) for i in range(3)]
+    points = [[(p[i]-center[i])*size for i in range(3)] for p in points]
+    stats = {
+        "vertices": len(points), "faces": len(faces),
+        "mean_edge_error": sum(errors)/len(errors),
+        "max_edge_error": max(errors),
+        "target_gaussian_curvature": -(math.log(factor)/size)**2,
+        "iterations": iterations,
+        "initialization": ("rosette" if factor > 1.0 else "cylinder")
+                          if closed else "open strip",
+    }
+    return {"points": points, "faces": faces,
+            "row_ids": row_ids[::resolution],
+            "all_row_ids": row_ids,
+            "counts": stitch_counts(base, rows, factor),
+            "closed": closed, "stats": stats}
+
+
+# 4. FINISH: CONVERT TO RHINO GEOMETRY AND EXPLAIN THE OUTPUT
+def to_rhino(result):
+    import Rhino.Geometry as rg
+    points = [rg.Point3d(*p) for p in result["points"]]
     mesh = rg.Mesh()
     for p in points:
-        mesh.Vertices.Add(p[0], p[1], p[2])
-    for a, b, c in faces:
+        mesh.Vertices.Add(p)
+    for a, b, c in result["faces"]:
         mesh.Faces.AddFace(a, b, c)
     mesh.Normals.ComputeNormals()
     mesh.Compact()
-    return mesh
 
+    def curve(ids, close=False):
+        polyline = rg.Polyline()
+        for index in ids:
+            polyline.Add(points[index])
+        if close:
+            polyline.Add(points[ids[0]])
+        return polyline.ToPolylineCurve()
 
-# ======================================================================
-# Tangent sphere growth
-# ======================================================================
-
-
-def random_unit_vector():
-    """Return a random direction on the unit sphere."""
-    z = random.uniform(-1.0, 1.0)
-    t = random.uniform(0.0, 2.0 * math.pi)
-    r = math.sqrt(1.0 - z * z)
-    return rg.Vector3d(r * math.cos(t), r * math.sin(t), z)
-
-
-def rotate_vector(v, axis, angle_rad):
-    """Rotate vector v around axis by angle (radians).
-
-    Params:
-        v (Rhino.Geometry.Vector3d): Vector to rotate. It is not changed.
-        axis (Rhino.Geometry.Vector3d): Rotation axis.
-        angle_rad (float): Rotation angle in radians.
-
-    Returns:
-        Rhino.Geometry.Vector3d: The rotated copy of v.
-    """
-    # 1.1 -- copy the input vector and the axis
-    vv = rg.Vector3d(v)
-    ax = rg.Vector3d(axis)
-
-    # 1.2 -- the axis must be unit length
-    ax.Unitize()
-
-    # 1.3 -- build a Rhino rotation transform around the world origin
-    xform = rg.Transform.Rotation(
-        angle_rad,
-        ax,
-        rg.Point3d.Origin,
-    )
-
-    # 1.4 -- apply the transform to the vector (in place)
-    vv.Transform(xform)
-
-    return vv
-
-
-def random_deflect(dir_vec, angle_max):
-    """Deflect a direction vector by a random small rotation.
-
-    Idea:
-      - build a plane perpendicular to the direction,
-      - pick a random axis in that plane,
-      - rotate by a random angle up to angle_max.
-
-    Params:
-        dir_vec (Rhino.Geometry.Vector3d): Direction to deflect.
-        angle_max (float): Largest deflection angle in radians.
-
-    Returns:
-        Rhino.Geometry.Vector3d: The deflected direction.
-    """
-    # 1.5 -- copy and unitize the incoming direction
-    d = rg.Vector3d(dir_vec)
-    d.Unitize()
-
-    # choose a helper vector that is not (nearly) parallel to d
-    helper = rg.Vector3d(0, 0, 1)
-    if abs(rg.Vector3d.Multiply(d, helper)) > 0.95:
-        helper = rg.Vector3d(0, 1, 0)
-
-    # 1.6 -- build a perpendicular frame U, V around d
-    U = rg.Vector3d.CrossProduct(d, helper)
-    U.Unitize()
-    V = rg.Vector3d.CrossProduct(d, U)
-    V.Unitize()
-
-    # 1.7 -- pick a random axis in the perpendicular plane
-    phi = random.uniform(0.0, 2.0 * math.pi)
-    axis = U * math.cos(phi) + V * math.sin(phi)
-
-    # 1.8 -- rotate by a random angle up to angle_max
-    ang = random.uniform(0.0, angle_max)
-    return rotate_vector(d, axis, ang)
-
-
-def cell_key(pt, cs):
-    """Map a 3D point to a grid cell index (ix, iy, iz) for cell size cs."""
-    return (
-        int(math.floor(pt.X / cs)),
-        int(math.floor(pt.Y / cs)),
-        int(math.floor(pt.Z / cs)),
-    )
-
-
-def neighbor_keys(k):
-    """Yield the 27 cell keys around and including cell k (3x3x3)."""
-    x, y, z = k
-    for dx in (-1, 0, 1):
-        for dy in (-1, 0, 1):
-            for dz in (-1, 0, 1):
-                yield (x + dx, y + dy, z + dz)
-
-
-def can_place_tangent(center, r_child, grid, cs, eps=1e-6):
-    """Check whether a sphere can be placed without overlapping others.
-
-    Touching is allowed, overlapping is not. Two spheres overlap when
-        distance < r_child + r_existing - eps
-
-    Params:
-        center (Rhino.Geometry.Point3d): Center of the new sphere.
-        r_child (float): Radius of the new sphere.
-        grid (dict): Spatial hash, cell key -> list of (center, radius).
-        cs (float): Cell size of the grid.
-        eps (float): Tolerance so touching spheres count as free. Default 1e-6.
-
-    Returns:
-        bool: True if the sphere fits.
-    """
-    k = cell_key(center, cs)
-
-    # 2.2 -- only check spheres in nearby grid cells
-    for nk in neighbor_keys(k):
-        if nk not in grid:
-            continue
-
-        for (c2, r2) in grid[nk]:
-            # 2.1 -- overlap rule
-            if center.DistanceTo(c2) < (r_child + r2 - eps):
-                return False
-
-    return True
-
-
-def add_to_grid(center, radius, grid, cs):
-    """Store (center, radius) in its grid cell for fast lookup later."""
-    key = cell_key(center, cs)
-    # 2.3 -- store center and radius
-    grid.setdefault(key, []).append((center, radius))
-
-
-def grow_tangent_spheres(
-    seed_pt=None,
-    seed_radius=5.0,
-    iterations=30,
-    radius_decay=0.92,
-    branch_chance=0.2,
-    angle_max=0.8,
-    min_radius=0.5,
-    seed_dir=None,
-    seed=None,
-):
-    """Grow a branching chain of touching spheres from a seed sphere.
-
-    Every generation, each tip places one child sphere (sometimes two) that
-    touches its parent. The child is a bit smaller and points in a slightly
-    deflected direction. Children that would overlap an existing sphere are
-    retried in another direction; growth stops when nothing fits anymore.
-
-    Params:
-        seed_pt (Rhino.Geometry.Point3d): Start point. Default world origin.
-        seed_radius (float): Radius of the first sphere. Default 5.0.
-        iterations (int): Maximum number of generations. Default 30.
-        radius_decay (float): Shrink factor per generation. Default 0.92.
-        branch_chance (float): Chance (0-1) that a tip gets a second child.
-            Default 0.2.
-        angle_max (float): Largest deflection per generation, in radians.
-            Default 0.8. Below about 0.6 a second child never fits beside
-            its sibling, so the growth does not branch.
-        min_radius (float): Stop growing a branch when spheres get smaller
-            than this. Default 0.5.
-        seed_dir (Rhino.Geometry.Vector3d): Initial direction. None picks a
-            random one. Default None.
-        seed (int): Random seed; the same seed gives the same result.
-            None gives a new result every time. Default None.
-
-    Returns:
-        tuple: (spheres, lines, tip_points)
-            spheres    -- list of Rhino.Geometry.Sphere
-            lines      -- list of Rhino.Geometry.Line, parent to child
-            tip_points -- list of Rhino.Geometry.Point3d, the last tips
-    """
-    if seed_pt is None:
-        seed_pt = rg.Point3d(0, 0, 0)
-    if seed is not None:
-        random.seed(seed)
-
-    # STEP 3 -- initial direction: use seed_dir if given, otherwise random
-    if seed_dir:
-        # 3.1 -- copy and unitize seed_dir
-        d0 = rg.Vector3d(seed_dir)
-        d0.Unitize()
+    rows_out = [curve(ids, result["closed"]) for ids in result["row_ids"]]
+    all_rows = result["all_row_ids"]
+    if result["closed"]:
+        boundaries = [rows_out[0], rows_out[-1]]
     else:
-        d0 = random_unit_vector()
+        outline = (all_rows[0] + [r[-1] for r in all_rows[1:]]
+                   + all_rows[-1][-2::-1]
+                   + [r[0] for r in all_rows[-2:0:-1]])
+        boundaries = [curve(outline, True)]
+    stats = result["stats"]
+    info = ("Model: {} | Start: {}\n"
+            "Stitches per row (base first): {}\n"
+            "Vertices: {} | Triangles: {}\n"
+            "Mean edge error: {:.2%} | Max: {:.2%}\n"
+            "Target K: {:.6g} per document-unit squared\n"
+            "Approximate sheet; no thickness or self-collision.").format(
+                HYPERBOLIC_MODEL_VERSION, stats["initialization"],
+                ", ".join(str(c) for c in result["counts"]),
+                stats["vertices"], stats["faces"],
+                stats["mean_edge_error"], stats["max_edge_error"],
+                stats["target_gaussian_curvature"])
+    if stats["iterations"] == 0:
+        info += "\nUNRELAXED: iterations is zero."
+    if stats["mean_edge_error"] > 0.05:
+        info += "\nPoor length fit: try more iterations or less growth."
+    return mesh, rows_out, boundaries, result["counts"], info
 
-    spheres, lines = [], []
 
-    # 4.1 -- cell size for the spatial hash. Two spheres can only collide
-    # when their centers are closer than the sum of their radii, which is
-    # at most 2 * seed_radius. With cells at least that big, checking the
-    # 3x3x3 neighbouring cells is enough to find every possible collision.
-    cell_size = max(2.0 * seed_radius, 2.0 * min_radius)
+def grasshopper_outputs(inputs):
+    defaults = dict(base_chain_stitch_count=8, rows=16, increase=1.25,
+                    stitch_size=1.0, resolution=2, iterations=600,
+                    closed=True, seed=1)
+    if inputs.get("run", True) is False:
+        return None, [], [], [], "Paused. Set run to True."
+    values = {name: defaults[name] if inputs.get(name) is None else inputs[name]
+              for name in defaults}
+    return to_rhino(generate(**values))
 
-    grid = {}
 
-    # 4.2 -- create the seed sphere and store it in the grid
-    spheres.append(rg.Sphere(seed_pt, seed_radius))
-    add_to_grid(seed_pt, seed_radius, grid, cell_size)
+def create_hyperbolic_surface(base_chain_stitch_count=8, rows=16,
+                              increase=1.25, stitch_size=1.0,
+                              resolution=2, iterations=600,
+                              closed=True, seed=1, run=True):
+    """Public entry point; export this from cdf.__init__ for package use."""
+    return grasshopper_outputs({
+        "base_chain_stitch_count": base_chain_stitch_count,
+        "rows": rows,
+        "increase": increase,
+        "stitch_size": stitch_size,
+        "resolution": resolution,
+        "iterations": iterations,
+        "closed": closed,
+        "seed": seed,
+        "run": run,
+    })
 
-    # 4.3 -- tips are the active growth states: (point, direction, radius)
-    tips = [(seed_pt, d0, seed_radius)]
 
-    for i in range(iterations):
-
-        new_tips = []
-
-        # 4.4 -- grow from each active tip
-        for (pt, d, r_parent) in tips:
-
-            # child radius shrinks
-            r_child = r_parent * radius_decay
-            if r_child < min_radius:
-                continue
-
-            # 4.5 -- branching: usually 1 child, sometimes 2
-            n_children = 1 + (1 if random.random() < branch_chance else 0)
-
-            for c in range(n_children):
-
-                # 4.6 -- try up to 20 directions to find a free placement
-                for t in range(20):
-
-                    # new direction = deflected parent direction
-                    d_child = random_deflect(d, angle_max)
-                    d_child.Unitize()
-
-                    # 4.7 -- tangency rule:
-                    # distance between centers = r_parent + r_child
-                    step = r_parent + r_child
-                    new_pt = pt + d_child * step
-
-                    # 4.8 -- accept only if nothing overlaps
-                    if can_place_tangent(new_pt, r_child, grid, cell_size, eps=1e-4):
-
-                        spheres.append(rg.Sphere(new_pt, r_child))
-                        add_to_grid(new_pt, r_child, grid, cell_size)
-
-                        # connection line from parent to child
-                        lines.append(rg.Line(pt, new_pt))
-
-                        # the child becomes a new tip
-                        new_tips.append((new_pt, d_child, r_child))
-                        break  # placed, stop trying
-
-        # 4.9 -- stop early if nothing new could be placed
-        if not new_tips:
-            break
-
-        tips = new_tips
-
-    # STEP 5 -- output only the tip points
-    tip_points = [pt for (pt, d, r) in tips]
-
-    return spheres, lines, tip_points
+# Executed when pasted into Grasshopper, but not on normal module import.
+if "ghenv" in globals():
+    M, R, B, C, Info = grasshopper_outputs(globals())

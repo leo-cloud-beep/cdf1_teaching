@@ -22,13 +22,13 @@ Describe typical classes found in project
 
 from .geometry_basics import *
 from .algorithms import *
-from .bismuth_crystal import *
+from .bismuth_growth import *
 
 # If you add a new python file...
 
 __all__ = []
 
-from .bismuth_crystal import (
+from .bismuth_growth import (
     create_seed,
     grow_hoppers,
     add_branches,
