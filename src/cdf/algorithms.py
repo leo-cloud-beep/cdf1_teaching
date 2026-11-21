@@ -1,3 +1,5 @@
+
+
 import math
 import random
 
@@ -386,3 +388,538 @@ def create_hyperbolic_surface(base_chain_stitch_count=8, rows=16,
 # Executed when pasted into Grasshopper, but not on normal module import.
 if "ghenv" in globals():
     M, R, B, C, Info = grasshopper_outputs(globals())
+
+
+"------------------------------------------------------assignemnt 2.2----------------------------------------------------"
+
+
+
+
+def generate_growth_rows(points, start_radius=3.0, spacing=2.0,
+                         speed=1.0, time=10.0, boundary=None):
+  
+    import math
+    import Rhino
+    import Rhino.Geometry as rg
+
+    r0, gap, v, t = map(float, (start_radius, spacing, speed, time))
+    if any(math.isnan(x) or math.isinf(x) for x in (r0, gap, v, t)):
+        raise ValueError("All numeric inputs must be finite.")
+    if r0 <= 0 or gap <= 0 or v < 0 or t < 0:
+        raise ValueError("Radius/spacing must be > 0; speed/time must be >= 0.")
+
+    centres = [] if points is None else list(points)
+    if not centres:
+        return [], []
+    if any(not isinstance(p, rg.Point3d) or not p.IsValid for p in centres):
+        raise ValueError("Set points to List Access with the Point3d type hint.")
+
+    base_plane = rg.Plane.WorldXY
+    if boundary is not None:
+        if not isinstance(boundary, rg.Curve) or not boundary.IsValid:
+            raise ValueError("Connect the boundary with the Curve type hint.")
+        if not boundary.IsClosed:
+            raise ValueError("The boundary must be one closed curve.")
+        doc = Rhino.RhinoDoc.ActiveDoc
+        tol = doc.ModelAbsoluteTolerance if doc is not None else 0.001
+        planar, base_plane = boundary.TryGetPlane(tol)
+        if not planar:
+            raise ValueError("The boundary must be planar, but can lie on any plane.")
+        if any(abs(base_plane.DistanceTo(p)) > tol for p in centres):
+            raise ValueError("Populate points must lie in the boundary's plane.")
+
+    advance = v * t
+    steps = advance / gap
+    if math.isinf(steps) or math.isinf(r0 + advance):
+        raise ValueError("Growth extent is too large.")
+    row_count = int(math.floor(steps + 1e-9)) + 1
+    if (row_count + 1) * len(centres) > 20000:
+        raise ValueError("Too many circles: reduce time/speed or increase spacing.")
+
+    row_groups = []
+    fronts = []
+    for centre in centres:
+        row_plane = rg.Plane(base_plane)
+        row_plane.Origin = centre
+        group = []
+        for k in range(row_count):
+            radius = r0 + k * gap
+            group.append(rg.Circle(row_plane, radius).ToNurbsCurve())
+        row_groups.append(group)
+        fronts.append(rg.Circle(row_plane, r0 + advance).ToNurbsCurve())
+
+    return row_groups, fronts
+
+
+def limit_growth_rows(points, row_groups, boundary, tolerance=None):
+
+    import math
+    import Rhino
+    import Rhino.Geometry as rg
+
+    if tolerance is None:
+        doc = Rhino.RhinoDoc.ActiveDoc
+        tolerance = doc.ModelAbsoluteTolerance if doc is not None else 0.001
+    tol = float(tolerance)
+    if math.isnan(tol) or math.isinf(tol) or tol <= 0:
+        raise ValueError("Tolerance must be a positive finite number.")
+
+    allowed = (rg.PointContainment.Inside, rg.PointContainment.Coincident)
+    if not isinstance(boundary, rg.Curve) or not boundary.IsValid:
+        raise ValueError("Connect your outer boundary with the Curve type hint.")
+    if not boundary.IsClosed:
+        raise ValueError("The boundary must be one closed curve.")
+    planar, plane = boundary.TryGetPlane(tol)
+    if not planar:
+        raise ValueError("The boundary must be planar, but can lie on any plane.")
+
+    def local_vector(point, origin):
+        dx, dy, dz = point.X - origin.X, point.Y - origin.Y, point.Z - origin.Z
+        x, y = plane.XAxis, plane.YAxis
+        return (dx * x.X + dy * x.Y + dz * x.Z,
+                dx * y.X + dy * y.Y + dz * y.Z)
+    self_events = rg.Intersect.Intersection.CurveSelf(boundary, tol)
+    if self_events is not None and self_events.Count > 0:
+        raise ValueError("The boundary must not cross or overlap itself.")
+
+    centres = [] if points is None else list(points)
+    groups = [] if row_groups is None else list(row_groups)
+    if len(groups) != len(centres):
+        raise ValueError("Keep rows as a tree: one input branch per Populate point.")
+    for i, centre in enumerate(centres):
+        if not isinstance(centre, rg.Point3d) or not centre.IsValid:
+            raise ValueError("Set points to List Access and the Point3d type hint.")
+        if abs(plane.DistanceTo(centre)) > tol:
+            raise ValueError("Populate points must lie in the boundary's plane.")
+        if boundary.Contains(centre, plane, tol) not in allowed:
+            raise ValueError("Populate point {0} is outside the boundary.".format(i))
+
+    # Each neighbour defines a half-plane in the boundary's local coordinates:
+    # dot(point - centre, unit_direction_to_neighbour) <= distance / 2.
+    neighbours = []
+    for i, centre in enumerate(centres):
+        limits = []
+        for j, other in enumerate(centres):
+            if i == j:
+                continue
+            dx, dy = local_vector(other, centre)
+            distance = math.hypot(dx, dy)
+            if distance <= tol:
+                raise ValueError("Populate points {0} and {1} coincide.".format(i, j))
+            limits.append((dx / distance, dy / distance,
+                           distance / 2.0, math.atan2(dy, dx)))
+        neighbours.append(limits)
+
+    tau = 2.0 * math.pi
+    angle_eps = 1e-10
+    result = []
+    for i, centre in enumerate(centres):
+        seed_rows = []
+        for row_index, row in enumerate(groups[i]):
+            if (not isinstance(row, rg.Curve) or not row.IsValid or
+                    not row.IsClosed or not row.IsInPlane(plane, tol)):
+                raise ValueError("Rows must lie in the boundary plane. Update Generate Growth Rows and connect the same boundary to it.")
+            is_circle, fitted = row.TryGetCircle(tol)
+            if not is_circle or fitted.Center.DistanceTo(centre) > tol:
+                raise ValueError("Rows and points do not match. Use the same Populate output and order.")
+            radius = fitted.Radius
+            cuts = []
+
+            # Actual boundary intersections; these support curved boundaries.
+            events = rg.Intersect.Intersection.CurveCurve(row, boundary, tol, tol)
+            if events is None:
+                raise RuntimeError("Rhino could not evaluate a row/boundary intersection.")
+            for event in events:
+                hits = [event.PointA]
+                if event.IsOverlap:
+                    hits.append(event.PointA2)
+                for hit in hits:
+                    hx, hy = local_vector(hit, centre)
+                    cuts.append(math.atan2(hy, hx) % tau)
+
+            # Exact circle/bisector intersections, computed as angles.
+            active = [n for n in neighbours[i] if n[2] <= radius + tol]
+            for ux, uy, half_distance, direction in active:
+                if half_distance <= radius:
+                    delta = math.acos(min(1.0, half_distance / radius))
+                    cuts.extend(((direction - delta) % tau,
+                                 (direction + delta) % tau))
+
+            angles = [0.0]
+            for angle in sorted(cuts):
+                if angle_eps < angle < tau - angle_eps:
+                    if angle - angles[-1] > angle_eps:
+                        angles.append(angle)
+            angles.append(tau)
+
+            # All crossings are now cuts: membership is constant between cuts.
+            kept = []
+            for a, b in zip(angles[:-1], angles[1:]):
+                mid = (a + b) / 2.0
+                lx, ly = radius * math.cos(mid), radius * math.sin(mid)
+                x, y = plane.XAxis, plane.YAxis
+                probe = rg.Point3d(centre.X + lx * x.X + ly * y.X,
+                                   centre.Y + lx * x.Y + ly * y.Y,
+                                   centre.Z + lx * x.Z + ly * y.Z)
+                inside = boundary.Contains(probe, plane, tol) in allowed
+                numeric_eps = 1e-12 * max(1.0, radius)
+                owned = all(lx * ux + ly * uy <= half + numeric_eps
+                            for ux, uy, half, direction in active)
+                if inside and owned:
+                    if kept and abs(kept[-1][1] - a) <= angle_eps:
+                        kept[-1] = (kept[-1][0], b)
+                    else:
+                        kept.append((a, b))
+
+            # Join continuity across the circle's 0/2*pi seam.
+            if (len(kept) > 1 and kept[0][0] <= angle_eps and
+                    kept[-1][1] >= tau - angle_eps):
+                wrapped = (kept[-1][0], kept[0][1] + tau)
+                kept = kept[1:-1] + [wrapped]
+
+            pieces = []
+            row_plane = rg.Plane(plane)
+            row_plane.Origin = centre
+            circle = rg.Circle(row_plane, radius)
+            for a, b in kept:
+                if (b - a) * radius <= tol:
+                    continue
+                if b - a >= tau - angle_eps:
+                    pieces.append(row.DuplicateCurve())
+                else:
+                    arc = rg.Arc(circle, rg.Interval(a, b))
+                    if not arc.IsValid:
+                        raise RuntimeError("Rhino could not construct a clipped circular arc.")
+                    piece = arc.ToNurbsCurve()
+                    if piece is None or not piece.IsValid:
+                        raise RuntimeError("Rhino could not convert a clipped arc to a curve.")
+                    pieces.append(piece)
+            seed_rows.append(pieces)
+        result.append(seed_rows)
+
+    return result
+
+
+def create_tapered_tiles(points, row_curves, boundary, width=0.06, depth=0.08,
+                         gap=0.01, rotation=0.0, tolerance=None,
+                         sizes=None, seed=1):
+
+    import math
+    import random
+    import Rhino
+    import Rhino.Geometry as rg
+
+    doc = Rhino.RhinoDoc.ActiveDoc
+    tol = float(tolerance if tolerance is not None else
+                (doc.ModelAbsoluteTolerance if doc is not None else 0.001))
+    width, depth, gap, rotation = map(float, (width, depth, gap, rotation))
+    if any(math.isnan(v) or math.isinf(v) for v in (tol, width, depth, gap, rotation)):
+        raise ValueError("All numeric inputs must be finite.")
+    if tol <= 0 or width <= tol or depth <= tol or gap < 0:
+        raise ValueError("Width/depth must exceed model tolerance; gap must be >= 0.")
+    if not isinstance(boundary, rg.Curve) or not boundary.IsValid or not boundary.IsClosed:
+        raise ValueError("Connect the same closed Curve boundary as Limit Growth.")
+    planar, plane = boundary.TryGetPlane(tol)
+    if not planar:
+        raise ValueError("The boundary must be planar.")
+    crossings = rg.Intersect.Intersection.CurveSelf(boundary, tol)
+    if crossings is not None and crossings.Count:
+        raise ValueError("The boundary must not cross or overlap itself.")
+
+    def uv(point):
+        d = (point.X - plane.Origin.X, point.Y - plane.Origin.Y,
+             point.Z - plane.Origin.Z)
+        x, y = plane.XAxis, plane.YAxis
+        return (d[0]*x.X + d[1]*x.Y + d[2]*x.Z,
+                d[0]*y.X + d[1]*y.Y + d[2]*y.Z)
+
+    centres = [] if points is None else list(points)
+    allowed = (rg.PointContainment.Inside, rg.PointContainment.Coincident)
+    for p in centres:
+        if not isinstance(p, rg.Point3d) or not p.IsValid:
+            raise ValueError("Set points to List Access, Point3d and Flatten.")
+        if abs(plane.DistanceTo(p)) > tol or boundary.Contains(p, plane, tol) not in allowed:
+            raise ValueError("Use the filtered Populate points inside the boundary, in its plane.")
+    seed_uv = [uv(p) for p in centres]
+    for i, (sx, sy) in enumerate(seed_uv):
+        for qx, qy in seed_uv[:i]:
+            if math.hypot(qx-sx, qy-sy) <= tol:
+                raise ValueError("Populate points must be distinct.")
+
+    seed_value = float(seed if seed is not None else 1)
+    if math.isnan(seed_value) or math.isinf(seed_value) or seed_value != int(seed_value):
+        raise ValueError("seed must be a whole number.")
+    if sizes is None:
+        factors = []
+    else:
+        try:
+            factors = list(sizes)
+        except TypeError:
+            factors = [sizes]
+    if not factors:
+        rng = random.Random(int(seed_value))
+        factors = [rng.uniform(0.65, 1.0) for _ in centres]
+    elif len(factors) == 1:
+        factors = factors * len(centres)
+    if len(factors) != len(centres):
+        raise ValueError("sizes needs one value per filtered point, one shared value, or no values for automatic sizes.")
+    factors = list(map(float, factors))
+    if any(math.isnan(v) or math.isinf(v) or v <= 0 or v > 1 for v in factors):
+        raise ValueError("Each size must be greater than 0 and at most 1. Increase growth time for larger available radii.")
+
+    tau = 2.0 * math.pi
+    records = [[] for _ in centres]
+    for curve in ([] if row_curves is None else row_curves):
+        if (not isinstance(curve, rg.Curve) or not curve.IsValid or
+                not curve.IsClosed or not curve.IsInPlane(plane, tol)):
+            raise ValueError("Connect the ORIGINAL rows output from Generate Growth Rows (full circles), not clipped_rows.")
+        ok, fitted = curve.TryGetCircle(tol)
+        if not ok:
+            raise ValueError("Use the original full-circle rows from Generate Growth Rows.")
+        centre, radius = fitted.Center, fitted.Radius
+        matches = [i for i, p in enumerate(centres) if p.DistanceTo(centre) <= tol]
+        if len(matches) != 1:
+            raise ValueError("A row does not match one centre. Use the SAME filtered Cull Pattern points as the growth components.")
+        index = matches[0]
+        record = next((r for r in records[index] if abs(r['radius']-radius) <= tol), None)
+        if record is None:
+            record = {'radius': radius}
+            records[index].append(record)
+
+    stats = {'centres': len(centres), 'candidates': 0, 'tiles': 0,
+             'cut_tiles': 0, 'outside_limits': 0, 'too_close': 0,
+             'small_rows': 0, 'tiny_pieces': 0, 'sizes': factors,
+             'hidden_centres': [], 'radii': [], 'order': [],
+             'fragment_rejections': 0}
+    for seed_records in records:
+        seed_records.sort(key=lambda record: record['radius'])
+        for a, b in zip(seed_records[:-1], seed_records[1:]):
+            if depth + gap > b['radius'] - a['radius'] + tol:
+                raise ValueError("depth + gap exceeds row spacing. Reduce depth/gap or increase spacing in Generate Growth Rows.")
+
+    patch_radii = [(rows[-1]['radius'] + depth/2.0) * factors[i] if rows else 0.0
+                   for i, rows in enumerate(records)]
+    for i, rows in enumerate(records):
+        if rows and patch_radii[i] <= max(tol, rows[0]['radius']-depth/2.0) + tol:
+            raise ValueError("Size for centre {0} is too small to reach its first tile row. Increase its size or growth time.".format(i))
+    order = sorted((i for i, rows in enumerate(records) if rows),
+                   key=lambda i: (-patch_radii[i], i))
+    stats['radii'], stats['order'] = patch_radii, order
+
+    def circle_at(index, radius):
+        p = rg.Plane(plane)
+        p.Origin = centres[index]
+        return rg.Circle(p, radius).ToNurbsCurve()
+
+    def clip_region(a, b, subtract=False):
+        relation = rg.Curve.PlanarClosedCurveRelationship(a, b, plane, tol)
+        if subtract:
+            if relation == rg.RegionContainment.Disjoint:
+                return [a]
+            if relation == rg.RegionContainment.AInsideB:
+                return []
+            # Every subtractor is a disk at least as large as the original
+            # patch. It cannot form a contained hole inside a patch fragment.
+            if relation == rg.RegionContainment.BInsideA:
+                raise RuntimeError("Unexpected circular containment. Check the model tolerance relative to the patch sizes.")
+            result = rg.Curve.CreateBooleanDifference(a, b, tol)
+        else:
+            if relation == rg.RegionContainment.Disjoint:
+                return []
+            if relation == rg.RegionContainment.AInsideB:
+                return [a]
+            if relation == rg.RegionContainment.BInsideA:
+                return [b.DuplicateCurve()]
+            result = rg.Curve.CreateBooleanIntersection(a, b, tol)
+        if result is None:
+            raise RuntimeError("Rhino could not calculate a circular trim. Check the boundary and model tolerance.")
+        result = list(result)
+        if any(not curve.IsValid or not curve.IsClosed for curve in result):
+            raise RuntimeError("Rhino returned an invalid circular trim.")
+        return result
+
+    # Reserve the WHOLE disk, including its centre opening and tile joints.
+    # This prevents weaker tiles from showing through a dominant pattern.
+    # Increasing the cutting radius by gap leaves a circular joint.
+    patches = [circle_at(i, r) if r > 0 else None for i, r in enumerate(patch_radii)]
+    cutters = [circle_at(i, r+gap) if r > 0 else None for i, r in enumerate(patch_radii)]
+    regions = [[] for _ in centres]
+    for rank, i in enumerate(order):
+        parts = clip_region(patches[i], boundary)
+        for j in order[:rank]:
+            distance = math.hypot(seed_uv[i][0]-seed_uv[j][0], seed_uv[i][1]-seed_uv[j][1])
+            if distance >= patch_radii[i]+patch_radii[j]+gap+tol:
+                continue
+            parts = [piece for part in parts for piece in clip_region(part, cutters[j], True)]
+            if not parts:
+                break
+        regions[i] = parts
+        if not parts:
+            stats['hidden_centres'].append(i)
+
+    # Use all angular positions, including those whose centreline is outside
+    # a limit but whose finite footprint still extends inside it.
+    # Alternate rows shift half a pitch to stagger joints.
+    for i, seed_records in enumerate(records):
+        for row_index, record in enumerate(seed_records):
+            r = record['radius']
+            inner = r - depth/2.0
+            record['ids'] = []
+            if not regions[i]:
+                continue
+            if inner <= tol or gap >= 2.0*inner:
+                stats['small_rows'] += 1
+                continue
+            count = max(6, int(math.floor(tau*r/(width+gap) + 0.5)))
+            if count > 100000:
+                raise ValueError("Tile width is too small for these row radii.")
+            pitch = tau/count
+            gap_angle = 2.0*math.asin(min(1.0, gap/(2.0*inner)))
+            half = (pitch-gap_angle)/2.0
+            if half <= 0 or 2.0*inner*math.sin(half) <= tol:
+                stats['small_rows'] += 1
+                continue
+            phase = (0.5 + 0.5*(row_index % 2))*pitch
+            record.update({'ids': range(count), 'pitch': pitch,
+                           'phase': phase, 'half': half})
+            stats['candidates'] += count
+            if stats['candidates'] > 100000:
+                raise ValueError("More than 100,000 candidate tiles. Increase width or reduce the number of centres/rows.")
+
+    def edges(poly):
+        return list(zip(poly, poly[1:] + poly[:1]))
+
+    def area(curve):
+        properties = rg.AreaMassProperties.Compute(curve, tol)
+        if properties is None:
+            raise RuntimeError("Rhino could not measure a cut tile. Check boundary validity and model tolerance.")
+        value = abs(properties.Area)
+        properties.Dispose()
+        return value
+
+    def polygons_overlap(a, b):
+        # Separating-axis test for convex polygons; edge contact is allowed.
+        for p, q in edges(a) + edges(b):
+            nx, ny = -(q[1]-p[1]), q[0]-p[0]
+            length = math.hypot(nx, ny)
+            if length <= 1e-15:
+                continue
+            nx, ny = nx/length, ny/length
+            aa = [x*nx+y*ny for x, y in a]
+            bb = [x*nx+y*ny for x, y in b]
+            if min(max(aa), max(bb)) - max(min(aa), min(bb)) <= 1e-12:
+                return False
+        return True
+
+    def point_segment_distance_sq(p, a, b):
+        dx, dy = b[0]-a[0], b[1]-a[1]
+        denom = dx*dx + dy*dy
+        t = 0.0 if denom == 0 else max(0.0, min(1.0,
+            ((p[0]-a[0])*dx+(p[1]-a[1])*dy)/denom))
+        return (p[0]-a[0]-t*dx)**2 + (p[1]-a[1]-t*dy)**2
+
+    min_gap_sq = max(0.0, gap-tol)**2
+
+    def too_close(a, b):
+        if polygons_overlap(a, b):
+            return True
+        if min_gap_sq == 0:
+            return False
+        for p in a:
+            for c, d in edges(b):
+                if point_segment_distance_sq(p, c, d) < min_gap_sq:
+                    return True
+        for p in b:
+            for c, d in edges(a):
+                if point_segment_distance_sq(p, c, d) < min_gap_sq:
+                    return True
+        return False
+
+    # Broad-phase spatial grid, followed by actual polygon overlap/distance.
+    cell_size = max(width+gap, depth+gap, 10.0*tol)
+
+    def cells(poly, padding=0.0):
+        x0 = int(math.floor((min(p[0] for p in poly)-padding)/cell_size))
+        x1 = int(math.floor((max(p[0] for p in poly)+padding)/cell_size))
+        y0 = int(math.floor((min(p[1] for p in poly)-padding)/cell_size))
+        y1 = int(math.floor((max(p[1] for p in poly)+padding)/cell_size))
+        return [(x, y) for x in range(x0, x1+1) for y in range(y0, y1+1)]
+
+    angle = math.radians(rotation % 360.0)
+    ca, sa = math.cos(angle), math.sin(angle)
+    output = []
+    for seed_index, seed_records in enumerate(records):
+        sx, sy = seed_uv[seed_index]
+        # Other seeds are already separated by their circular region masks.
+        # Use footprint collision tests only within this seed's own rows.
+        grid, accepted = {}, []
+        seed_output = []
+        for record in seed_records:
+            row_output = []
+            r = record['radius']
+            for k in record['ids']:
+                theta = record['phase'] + k*record['pitch']
+                h = record['half']
+                inner, outer = r-depth/2.0, r+depth/2.0
+                poly = [(sx+radius*math.cos(a), sy+radius*math.sin(a))
+                        for radius, a in ((inner, theta-h), (outer, theta-h),
+                                          (outer, theta+h), (inner, theta+h))]
+                mx, my = sx+r*math.cos(theta), sy+r*math.sin(theta)
+                if abs(angle) > 1e-12:
+                    poly = [(mx+ca*(x-mx)-sa*(y-my), my+sa*(x-mx)+ca*(y-my))
+                            for x, y in poly]
+
+                world = [plane.PointAt(x, y) for x, y in poly]
+                outline = rg.Polyline(world+[world[0]]).ToNurbsCurve()
+                pieces = [piece for region in regions[seed_index]
+                          for piece in clip_region(outline, region)]
+                if not pieces:
+                    stats['outside_limits'] += 1
+                    continue
+                cut = not (len(pieces) == 1 and pieces[0] is outline)
+
+                nearby = set()
+                for key in cells(poly, gap):
+                    nearby.update(grid.get(key, []))
+                if any(too_close(poly, accepted[index]) for index in sorted(nearby)):
+                    stats['too_close'] += 1
+                    continue
+
+                kept = []
+                measured = sorted(((area(piece), piece) for piece in pieces),
+                                  key=lambda pair: -pair[0])
+                for piece_area, piece in measured:
+                    if not piece.IsValid or not piece.IsClosed:
+                        raise RuntimeError("Rhino returned an invalid boundary cut.")
+                    if piece_area <= tol*tol:
+                        stats['tiny_pieces'] += 1
+                        continue
+                    fragment_too_close = False
+                    if gap > tol:
+                        for previous in kept:
+                            success, pa, pb = piece.ClosestPoints(previous)
+                            if not success:
+                                raise RuntimeError("Rhino could not check the spacing between cut fragments.")
+                            if pa.DistanceTo(pb) < gap-tol:
+                                fragment_too_close = True
+                                break
+                    if fragment_too_close:
+                        stats['fragment_rejections'] += 1
+                        continue
+                    surfaces = rg.Brep.CreatePlanarBreps(piece, tol)
+                    if surfaces is None or len(surfaces) != 1 or not surfaces[0].IsValid:
+                        raise RuntimeError("Rhino could not create a cut tile surface. Check boundary validity and model tolerance.")
+                    row_output.append((piece, surfaces[0]))
+                    stats['tiles'] += 1
+                    if cut:
+                        stats['cut_tiles'] += 1
+                    kept.append(piece)
+                if not kept:
+                    continue
+                index = len(accepted)
+                accepted.append(poly)
+                for key in cells(poly):
+                    grid.setdefault(key, []).append(index)
+            seed_output.append(row_output)
+        output.append(seed_output)
+    return output, stats
